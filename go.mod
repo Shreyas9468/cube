@@ -5,6 +5,8 @@ go 1.24
 toolchain go1.24.0
 
 require (
+	github.com/c9s/goprocinfo v0.0.0-20210130143923-c95fcf8c64a8
+	github.com/go-chi/chi/v5 v5.4.0
 	github.com/golang-collections/collections v0.0.0-20130729185459-604e922904d3
 	github.com/google/uuid v1.6.0
 	github.com/moby/moby/api v1.56.1

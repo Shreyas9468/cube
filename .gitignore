@@ -1,0 +1,16 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+
+# Database files
+*.db
+
+# Environment & IDE
+.kilo/
+.idea/
+.vscode/
+*.swp

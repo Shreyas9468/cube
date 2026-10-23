@@ -3,7 +3,7 @@ package task
 import (
 	"context"
 	"io"
-	"log"
+	"log/slog"
 	"math"
 	"os"
 	"time"
@@ -117,12 +117,12 @@ func (d *Docker) Run() DockerResult {
 	// Pull image.
 	reader, err := d.Client.ImagePull(ctx, d.Config.Image, client.ImagePullOptions{})
 	if err != nil {
-		log.Printf("Error pulling image %s: %v\n", d.Config.Image, err)
+		slog.Error("Image pull failed", "image", d.Config.Image, "error", err)
 		return DockerResult{Error: err}
 	}
 	defer reader.Close()
 	if _, err = io.Copy(os.Stdout, reader); err != nil {
-		log.Printf("Error streaming image pull output: %v\n", err)
+		slog.Warn("Error streaming image pull output", "image", d.Config.Image, "error", err)
 	}
 
 	// Restart & resource policy.
@@ -156,21 +156,22 @@ func (d *Docker) Run() DockerResult {
 		Name:       d.Config.Name,
 	})
 	if err != nil {
-		log.Printf("Error creating container using image %s: %v\n", d.Config.Image, err)
+		slog.Error("Container create failed", "image", d.Config.Image, "error", err)
 		return DockerResult{Error: err}
 	}
 
 	// Start container.
 	if _, err = d.Client.ContainerStart(ctx, resp.ID, client.ContainerStartOptions{}); err != nil {
-		log.Printf("Error starting container %s: %v\n", resp.ID, err)
+		slog.Error("Container start failed", "container_id", resp.ID, "error", err)
 		return DockerResult{Error: err}
 	}
+	slog.Info("Container started", "container_id", resp.ID, "image", d.Config.Image)
 
 	// Stream logs.
 	out, err := d.Client.ContainerLogs(ctx, resp.ID,
 		client.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
 	if err != nil {
-		log.Printf("Error getting logs for container %s: %v\n", resp.ID, err)
+		slog.Warn("Could not fetch container logs", "container_id", resp.ID, "error", err)
 		return DockerResult{Error: err}
 	}
 	defer out.Close()
@@ -181,11 +182,11 @@ func (d *Docker) Run() DockerResult {
 
 // Stop stops and removes the container with the given id.
 func (d *Docker) Stop(id string) DockerResult {
-	log.Printf("Attempting to stop container %v\n", id)
+	slog.Info("Stopping container", "container_id", id)
 	ctx := context.Background()
 
 	if _, err := d.Client.ContainerStop(ctx, id, client.ContainerStopOptions{}); err != nil {
-		log.Printf("Error stopping container %s: %v\n", id, err)
+		slog.Error("Container stop failed", "container_id", id, "error", err)
 		return DockerResult{Error: err}
 	}
 
@@ -193,9 +194,10 @@ func (d *Docker) Stop(id string) DockerResult {
 		RemoveVolumes: true,
 		Force:         false,
 	}); err != nil {
-		log.Printf("Error removing container %s: %v\n", id, err)
+		slog.Error("Container remove failed", "container_id", id, "error", err)
 		return DockerResult{Error: err}
 	}
 
+	slog.Info("Container removed", "container_id", id)
 	return DockerResult{Action: "stop", Result: "success", Error: nil}
 }

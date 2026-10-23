@@ -1,8 +1,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -11,50 +16,101 @@ import (
 	"github.com/Shreyas9468/cube/scheduler"
 	"github.com/Shreyas9468/cube/store"
 	"github.com/Shreyas9468/cube/task"
+	"github.com/Shreyas9468/cube/version"
 	"github.com/Shreyas9468/cube/worker"
 )
 
 func main() {
+	// ─── Structured logger ────────────────────────────────────────────────────
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
+	slog.Info("Cube orchestrator starting",
+		"version", version.Version,
+		"commit", version.Commit,
+		"built", version.BuildTime,
+	)
+
+	// ─── Addresses ────────────────────────────────────────────────────────────
 	whost := "0.0.0.0"
 	wport := 5555
-
 	mhost := "0.0.0.0"
 	mport := 5556
 
-	// Initialize persistent storage for worker and manager
+	// ─── Persistent stores ────────────────────────────────────────────────────
+	if err := os.MkdirAll("data", 0o755); err != nil {
+		slog.Error("Cannot create data directory", "error", err)
+		os.Exit(1)
+	}
+
 	wStore, err := store.NewBoltStore("data/worker.db", 0600, []string{"tasks"})
 	if err != nil {
-		fmt.Printf("Notice: starting worker in in-memory storage mode (%v)\n", err)
+		slog.Warn("Worker store unavailable, using in-memory mode", "error", err)
 	} else {
 		defer wStore.Close()
 	}
 
 	mStore, err := store.NewBoltStore("data/manager.db", 0600, []string{"tasks", "events"})
 	if err != nil {
-		fmt.Printf("Notice: starting manager in in-memory storage mode (%v)\n", err)
+		slog.Warn("Manager store unavailable, using in-memory mode", "error", err)
 	} else {
 		defer mStore.Close()
 	}
 
-	fmt.Println("Starting Cube worker daemon")
+	// ─── Worker daemon ────────────────────────────────────────────────────────
+	slog.Info("Initialising worker daemon", "address", fmt.Sprintf("%s:%d", whost, wport))
 	w := worker.New("worker-1", wStore)
 	wApi := worker.Api{Address: whost, Port: wport, Worker: w}
 
-	fmt.Println("Starting Cube cluster manager with EPVM scheduler")
+	// ─── Manager control plane ────────────────────────────────────────────────
+	slog.Info("Initialising manager with EPVM scheduler", "address", fmt.Sprintf("%s:%d", mhost, mport))
 	workers := []string{fmt.Sprintf("%s:%d", whost, wport)}
 	s := &scheduler.Epvm{Name: "epvm"}
 	m := manager.NewWithStore(workers, s, mStore)
 	mApi := manager.Api{Address: mhost, Port: mport, Manager: m}
 
+	// ─── Background loops ─────────────────────────────────────────────────────
 	go w.RunTaskLoop()
 	go w.CollectStats()
 	go m.ProcessTasks()
-	go wApi.Start()
 
-	time.Sleep(time.Millisecond * 500)
+	// Give workers a moment to start before the manager fires its first loop.
+	time.Sleep(500 * time.Millisecond)
 
-	// Submit an initial sample task via the manager control plane
-	testTask := task.Task{
+	// ─── HTTP servers (graceful shutdown-aware) ───────────────────────────────
+	wSrv := &http.Server{
+		Addr:         fmt.Sprintf("%s:%d", whost, wport),
+		Handler:      wApi.BuildRouter(),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+	mSrv := &http.Server{
+		Addr:         fmt.Sprintf("%s:%d", mhost, mport),
+		Handler:      mApi.BuildRouter(),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	go func() {
+		slog.Info("Worker API listening", "addr", wSrv.Addr)
+		if err := wSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("Worker API server error", "error", err)
+		}
+	}()
+	go func() {
+		slog.Info("Manager API listening", "addr", mSrv.Addr)
+		if err := mSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("Manager API server error", "error", err)
+		}
+	}()
+
+	// ─── Sample task ──────────────────────────────────────────────────────────
+	time.Sleep(200 * time.Millisecond)
+	sampleTask := task.Task{
 		ID:            uuid.New(),
 		Name:          "cube-task-sample",
 		State:         task.Scheduled,
@@ -65,14 +121,26 @@ func main() {
 		ID:        uuid.New(),
 		State:     task.Running,
 		Timestamp: time.Now().UTC(),
-		Task:      testTask,
+		Task:      sampleTask,
 	}
 	m.AddTask(te)
-	fmt.Printf("Submitted task %s to manager queue\n", testTask.ID)
+	slog.Info("Sample task submitted", "task_id", sampleTask.ID, "image", sampleTask.Image)
 
-	fmt.Printf("Manager API listening on %s:%d\n", mhost, mport)
-	fmt.Printf("Worker  API listening on %s:%d\n", whost, wport)
-	fmt.Fprintln(os.Stdout, "Press Ctrl-C to stop.")
+	// ─── Graceful shutdown ────────────────────────────────────────────────────
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-quit
+	slog.Info("Shutdown signal received", "signal", sig.String())
 
-	mApi.Start()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := wSrv.Shutdown(ctx); err != nil {
+		slog.Error("Worker server forced to shut down", "error", err)
+	}
+	if err := mSrv.Shutdown(ctx); err != nil {
+		slog.Error("Manager server forced to shut down", "error", err)
+	}
+
+	slog.Info("Cube orchestrator stopped cleanly")
 }

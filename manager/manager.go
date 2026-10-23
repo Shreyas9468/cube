@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -54,7 +54,7 @@ func (m *Manager) SelectWorker(t task.Task) (*node.Node, error) {
 // UpdateTasks polls every worker every 15 s and syncs task state into TaskDb.
 func (m *Manager) UpdateTasks() {
 	for {
-		log.Println("Checking for task updates from workers")
+		slog.Debug("Polling workers for task updates")
 		m.updateTasks()
 		time.Sleep(15 * time.Second)
 	}
@@ -62,27 +62,27 @@ func (m *Manager) UpdateTasks() {
 
 func (m *Manager) updateTasks() {
 	for _, worker := range m.Workers {
-		log.Printf("Checking worker %v for task updates\n", worker)
+		slog.Debug("Polling worker", "worker", worker)
 		url := fmt.Sprintf("http://%s/tasks", worker)
 		resp, err := http.Get(url)
 		if err != nil {
-			log.Printf("Error connecting to %v: %v\n", worker, err)
+			slog.Warn("Failed to connect to worker", "worker", worker, "error", err)
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
-			log.Printf("Unexpected status from %v: %d\n", worker, resp.StatusCode)
+			slog.Warn("Unexpected status from worker", "worker", worker, "status", resp.StatusCode)
 			continue
 		}
 
 		var tasks []*task.Task
 		if err = json.NewDecoder(resp.Body).Decode(&tasks); err != nil {
-			log.Printf("Error unmarshalling tasks from %s: %v\n", worker, err)
+			slog.Error("Failed to decode tasks from worker", "worker", worker, "error", err)
 			continue
 		}
 
 		for _, t := range tasks {
 			if _, ok := m.TaskWorkerMap[t.ID]; !ok {
-				log.Printf("Task %s not found in TaskWorkerMap\n", t.ID)
+				slog.Debug("Unknown task reported by worker — skipping", "task_id", t.ID, "worker", worker)
 				continue
 			}
 			taskList := m.TaskDb[t.ID]
@@ -90,6 +90,11 @@ func (m *Manager) updateTasks() {
 				continue
 			}
 			if taskList[len(taskList)-1].State != t.State {
+				slog.Info("Task state updated",
+					"task_id", t.ID,
+					"old_state", taskList[len(taskList)-1].State,
+					"new_state", t.State,
+				)
 				taskList[len(taskList)-1].State = t.State
 				m.persistTask(taskList[len(taskList)-1])
 			}
@@ -103,14 +108,15 @@ func (m *Manager) SendWork() {
 		e := m.Pending.Dequeue()
 		te := e.(task.TaskEvent)
 		t := te.Task
-		log.Printf("Pulled %v off pending queue\n", t)
+		slog.Info("Dispatching task from pending queue", "task_id", t.ID, "image", t.Image)
 
 		selectedNode, err := m.SelectWorker(t)
 		if err != nil {
-			log.Printf("Error selecting worker for task %s: %v\n", t.ID, err)
+			slog.Error("Worker selection failed", "task_id", t.ID, "error", err)
 			return
 		}
 		w := selectedNode.Name
+		slog.Info("Task assigned to worker", "task_id", t.ID, "worker", w)
 
 		m.EventDb[te.ID] = append(m.EventDb[te.ID], &te)
 		m.WorkerTaskMap[w] = append(m.WorkerTaskMap[w], t.ID)
@@ -123,25 +129,25 @@ func (m *Manager) SendWork() {
 
 		data, err := json.Marshal(te)
 		if err != nil {
-			log.Printf("Unable to marshal TaskEvent: %v\n", err)
+			slog.Error("Failed to marshal TaskEvent", "task_id", t.ID, "error", err)
 			return
 		}
 
 		url := fmt.Sprintf("http://%s/tasks", w)
 		resp, err := http.Post(url, "application/json", bytes.NewBuffer(data))
 		if err != nil {
-			log.Printf("Error connecting to %v: %v\n", w, err)
+			slog.Error("Failed to send task to worker", "task_id", t.ID, "worker", w, "error", err)
 			m.Pending.Enqueue(te)
 			return
 		}
 
 		var result task.DockerResult
 		if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			log.Printf("Error decoding response: %v\n", err)
+			slog.Error("Failed to decode worker response", "task_id", t.ID, "error", err)
 		}
-		log.Printf("Response from worker: %v\n", result)
+		slog.Info("Worker acknowledged task", "task_id", t.ID, "worker", w)
 	} else {
-		log.Println("No work in the queue")
+		slog.Debug("Pending queue empty — nothing to dispatch")
 	}
 }
 
@@ -169,7 +175,6 @@ func (m *Manager) GetNodes() []*node.Node {
 // SendWorkLoop processes pending work every 10 s.
 func (m *Manager) SendWorkLoop() {
 	for {
-		log.Println("Sending work to workers")
 		m.SendWork()
 		time.Sleep(10 * time.Second)
 	}
@@ -178,12 +183,15 @@ func (m *Manager) SendWorkLoop() {
 // DoHealthChecks runs a background loop to verify connectivity and health of all worker nodes.
 func (m *Manager) DoHealthChecks() {
 	for {
-		log.Println("Performing health checks on worker nodes")
+		slog.Debug("Running worker health checks")
 		for _, n := range m.WorkerNodes {
 			if err := n.GetStats(); err != nil {
-				log.Printf("Health check failed for node %s: %v\n", n.Name, err)
+				slog.Warn("Health check failed", "node", n.Name, "error", err)
 				n.Healthy = false
 			} else {
+				if !n.Healthy {
+					slog.Info("Node recovered", "node", n.Name)
+				}
 				n.Healthy = true
 			}
 		}
@@ -195,7 +203,7 @@ func (m *Manager) DoHealthChecks() {
 func (m *Manager) ReconcileTasks() {
 	for {
 		time.Sleep(20 * time.Second)
-		log.Println("Reconciling cluster tasks and assessing restart policies")
+		slog.Info("Running task reconciliation")
 		m.reconcile()
 	}
 }
@@ -216,7 +224,8 @@ func (m *Manager) reconcile() {
 		// Condition 1: Node assigned to the task is unhealthy
 		isNodeHealthy := nodeHealth[workerName]
 		if !isNodeHealthy && (latestTask.State == task.Running || latestTask.State == task.Scheduled) {
-			log.Printf("Worker %s hosting task %s is unhealthy. Initiating reconciliation.\n", workerName, latestTask.ID)
+			slog.Warn("Task on unhealthy node — reconciling",
+				"task_id", latestTask.ID, "worker", workerName)
 			m.maybeRestartTask(latestTask, "node_failure")
 			continue
 		}
@@ -243,7 +252,12 @@ func (m *Manager) maybeRestartTask(t *task.Task, reason string) {
 
 	if shouldRestart && t.RestartCount < maxRetries {
 		t.RestartCount++
-		log.Printf("Restarting task %s (attempt %d/%d, reason: %s)\n", t.ID, t.RestartCount, maxRetries, reason)
+		slog.Info("Restarting task",
+			"task_id", t.ID,
+			"attempt", t.RestartCount,
+			"max_retries", maxRetries,
+			"reason", reason,
+		)
 		retryTask := *t
 		retryTask.State = task.Scheduled
 		retryEvent := task.TaskEvent{
@@ -254,7 +268,8 @@ func (m *Manager) maybeRestartTask(t *task.Task, reason string) {
 		}
 		m.AddTask(retryEvent)
 	} else if shouldRestart {
-		log.Printf("Task %s exceeded max retry limit of %d. Marked as permanently failed.\n", t.ID, maxRetries)
+		slog.Warn("Task exceeded max retries — permanently failed",
+			"task_id", t.ID, "max_retries", maxRetries, "reason", reason)
 		t.State = task.Failed
 	}
 }
@@ -265,11 +280,11 @@ func (m *Manager) persistTask(t *task.Task) {
 	}
 	data, err := json.Marshal(t)
 	if err != nil {
-		log.Printf("Error marshalling task %s for persistence: %v\n", t.ID, err)
+		slog.Error("Failed to marshal task", "task_id", t.ID, "error", err)
 		return
 	}
 	if err := m.Store.Put("tasks", t.ID.String(), data); err != nil {
-		log.Printf("Error persisting task %s: %v\n", t.ID, err)
+		slog.Error("Failed to persist task", "task_id", t.ID, "error", err)
 	}
 }
 
@@ -279,11 +294,11 @@ func (m *Manager) persistEvent(te *task.TaskEvent) {
 	}
 	data, err := json.Marshal(te)
 	if err != nil {
-		log.Printf("Error marshalling event %s for persistence: %v\n", te.ID, err)
+		slog.Error("Failed to marshal event", "event_id", te.ID, "error", err)
 		return
 	}
 	if err := m.Store.Put("events", te.ID.String(), data); err != nil {
-		log.Printf("Error persisting event %s: %v\n", te.ID, err)
+		slog.Error("Failed to persist event", "event_id", te.ID, "error", err)
 	}
 }
 
@@ -327,7 +342,7 @@ func NewWithStore(workers []string, s scheduler.Scheduler, st store.Store) *Mana
 					taskDb[t.ID] = append(taskDb[t.ID], &t)
 				}
 			}
-			log.Printf("Recovered %d unique tasks from persistent store\n", len(taskDb))
+			slog.Info("Recovered tasks from store", "count", len(taskDb))
 		}
 
 		eventItems, err := st.List("events")
@@ -338,7 +353,7 @@ func NewWithStore(workers []string, s scheduler.Scheduler, st store.Store) *Mana
 					eventDb[te.ID] = append(eventDb[te.ID], &te)
 				}
 			}
-			log.Printf("Recovered %d task events from persistent store\n", len(eventDb))
+			slog.Info("Recovered events from store", "count", len(eventDb))
 		}
 	}
 

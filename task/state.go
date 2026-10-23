@@ -8,6 +8,22 @@ var stateTransitionMap = map[State][]State{
 	Failed:    {},
 }
 
+var stateNames = map[State]string{
+	Pending:   "Pending",
+	Scheduled: "Scheduled",
+	Running:   "Running",
+	Completed: "Completed",
+	Failed:    "Failed",
+}
+
+// String returns a human-readable name for the state.
+func (s State) String() string {
+	if name, ok := stateNames[s]; ok {
+		return name
+	}
+	return "Unknown"
+}
+
 // Contains checks if a given state exists in a slice.
 func Contains(states []State, state State) bool {
 	for _, s := range states {

@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/golang-collections/collections/queue"
@@ -27,7 +27,7 @@ type Worker struct {
 // CollectStats runs in a loop, gathering host metrics every 15 seconds.
 func (w *Worker) CollectStats() {
 	for {
-		log.Println("Collecting stats")
+		slog.Debug("Collecting host stats", "worker", w.Name)
 		w.Stats = GetStats()
 		w.Stats.TaskCount = w.TaskCount
 		time.Sleep(15 * time.Second)
@@ -40,10 +40,10 @@ func (w *Worker) RunTaskLoop() {
 		if w.Queue.Len() != 0 {
 			result := w.RunTask()
 			if result.Error != nil {
-				log.Printf("Error running task: %v\n", result.Error)
+				slog.Error("Task run failed", "worker", w.Name, "error", result.Error)
 			}
 		} else {
-			log.Printf("No tasks to process currently.\n")
+			slog.Debug("No tasks in queue, sleeping", "worker", w.Name)
 		}
 		time.Sleep(10 * time.Second)
 	}
@@ -59,7 +59,7 @@ func (w *Worker) RunTask() task.DockerResult {
 	t := w.Queue.Dequeue()
 
 	if t == nil {
-		log.Println("No tasks in the queue")
+		slog.Debug("Queue dequeue returned nil", "worker", w.Name)
 		return task.DockerResult{Error: nil}
 	}
 
@@ -79,11 +79,13 @@ func (w *Worker) RunTask() task.DockerResult {
 		case task.Completed:
 			result = w.StopTask(taskQueued)
 		default:
-			result.Error = errors.New("we should not get here")
+			result.Error = errors.New("unexpected task state in queue")
 		}
 	} else {
 		err := fmt.Errorf("invalid transition from %v to %v", taskPersisted.State, taskQueued.State)
 		result.Error = err
+		slog.Warn("Invalid state transition", "task_id", taskQueued.ID,
+			"from", taskPersisted.State, "to", taskQueued.State)
 	}
 
 	return result
@@ -96,7 +98,7 @@ func (w *Worker) StartTask(t task.Task) task.DockerResult {
 	d := task.NewDocker(config)
 	result := d.Run()
 	if result.Error != nil {
-		log.Printf("Error running task %v: %v\n", t.ID, result.Error)
+		slog.Error("Failed to start container", "task_id", t.ID, "image", t.Image, "error", result.Error)
 		t.State = task.Failed
 		w.Db[t.ID] = &t
 		return result
@@ -107,7 +109,7 @@ func (w *Worker) StartTask(t task.Task) task.DockerResult {
 	w.Db[t.ID] = &t
 	w.TaskCount++
 	w.persistTask(&t)
-	log.Printf("Started container %s for task %s\n", t.ContainerID, t.ID)
+	slog.Info("Container started", "task_id", t.ID, "container_id", t.ContainerID, "image", t.Image)
 	return result
 }
 
@@ -117,7 +119,7 @@ func (w *Worker) StopTask(t task.Task) task.DockerResult {
 	d := task.NewDocker(config)
 	result := d.Stop(t.ContainerID)
 	if result.Error != nil {
-		log.Printf("Error stopping task %v: %v\n", t.ID, result.Error)
+		slog.Error("Failed to stop container", "task_id", t.ID, "container_id", t.ContainerID, "error", result.Error)
 	}
 
 	t.FinishTime = time.Now().UTC()
@@ -125,7 +127,7 @@ func (w *Worker) StopTask(t task.Task) task.DockerResult {
 	w.Db[t.ID] = &t
 	w.TaskCount--
 	w.persistTask(&t)
-	log.Printf("Stopped container %s for task %s\n", t.ContainerID, t.ID)
+	slog.Info("Container stopped", "task_id", t.ID, "container_id", t.ContainerID)
 	return result
 }
 
@@ -135,11 +137,11 @@ func (w *Worker) persistTask(t *task.Task) {
 	}
 	data, err := json.Marshal(t)
 	if err != nil {
-		log.Printf("Error marshalling task %s for persistence: %v\n", t.ID, err)
+		slog.Error("Failed to marshal task for persistence", "task_id", t.ID, "error", err)
 		return
 	}
 	if err := w.Store.Put("tasks", t.ID.String(), data); err != nil {
-		log.Printf("Error persisting task %s: %v\n", t.ID, err)
+		slog.Error("Failed to persist task", "task_id", t.ID, "error", err)
 	}
 }
 
@@ -163,7 +165,7 @@ func New(name string, st store.Store) *Worker {
 				}
 			}
 			w.TaskCount = len(w.Db)
-			log.Printf("Recovered %d tasks from persistent store for worker %s\n", len(w.Db), name)
+			slog.Info("Recovered tasks from store", "worker", name, "count", len(w.Db))
 		}
 	}
 

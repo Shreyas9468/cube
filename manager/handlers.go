@@ -80,3 +80,10 @@ func (a *Api) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Added task %v to stop queue\n", te.Task.ID)
 	w.WriteHeader(204)
 }
+
+// GetNodesHandler returns all registered worker nodes and their status.
+func (a *Api) GetNodesHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	json.NewEncoder(w).Encode(a.Manager.GetNodes())
+}

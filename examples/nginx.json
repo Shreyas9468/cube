@@ -1,0 +1,8 @@
+{
+  "name": "nginx-web",
+  "image": "nginx:alpine",
+  "cpu": 0.5,
+  "memory": 536870912,
+  "disk": 2147483648,
+  "restartPolicy": "always"
+}

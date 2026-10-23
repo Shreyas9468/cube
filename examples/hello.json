@@ -1,0 +1,8 @@
+{
+  "name": "hello-service",
+  "image": "strm/helloworld-http",
+  "cpu": 0.25,
+  "memory": 268435456,
+  "disk": 1073741824,
+  "restartPolicy": "on-failure"
+}

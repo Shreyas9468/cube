@@ -161,6 +161,11 @@ func (m *Manager) GetTasks() []*task.Task {
 	return tasks
 }
 
+// GetNodes returns all registered worker nodes in the cluster.
+func (m *Manager) GetNodes() []*node.Node {
+	return m.WorkerNodes
+}
+
 // SendWorkLoop processes pending work every 10 s.
 func (m *Manager) SendWorkLoop() {
 	for {

@@ -21,6 +21,7 @@ func (a *Api) initRouter() {
 	a.Router.Get("/tasks", a.GetTasksHandler)
 	a.Router.Post("/tasks", a.StartTaskHandler)
 	a.Router.Delete("/tasks/{taskID}", a.StopTaskHandler)
+	a.Router.Get("/nodes", a.GetNodesHandler)
 }
 
 // Start initialises the router and serves HTTP.

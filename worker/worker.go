@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -9,6 +10,7 @@ import (
 	"github.com/golang-collections/collections/queue"
 	"github.com/google/uuid"
 
+	"github.com/Shreyas9468/cube/store"
 	"github.com/Shreyas9468/cube/task"
 )
 
@@ -19,6 +21,7 @@ type Worker struct {
 	Db        map[uuid.UUID]*task.Task
 	Stats     *Stats
 	TaskCount int
+	Store     store.Store
 }
 
 // CollectStats runs in a loop, gathering host metrics every 15 seconds.
@@ -103,6 +106,7 @@ func (w *Worker) StartTask(t task.Task) task.DockerResult {
 	t.State = task.Running
 	w.Db[t.ID] = &t
 	w.TaskCount++
+	w.persistTask(&t)
 	log.Printf("Started container %s for task %s\n", t.ContainerID, t.ID)
 	return result
 }
@@ -120,8 +124,50 @@ func (w *Worker) StopTask(t task.Task) task.DockerResult {
 	t.State = task.Completed
 	w.Db[t.ID] = &t
 	w.TaskCount--
+	w.persistTask(&t)
 	log.Printf("Stopped container %s for task %s\n", t.ContainerID, t.ID)
 	return result
+}
+
+func (w *Worker) persistTask(t *task.Task) {
+	if w.Store == nil {
+		return
+	}
+	data, err := json.Marshal(t)
+	if err != nil {
+		log.Printf("Error marshalling task %s for persistence: %v\n", t.ID, err)
+		return
+	}
+	if err := w.Store.Put("tasks", t.ID.String(), data); err != nil {
+		log.Printf("Error persisting task %s: %v\n", t.ID, err)
+	}
+}
+
+// New creates a Worker instance, recovering any persisted tasks from store.
+func New(name string, st store.Store) *Worker {
+	db := make(map[uuid.UUID]*task.Task)
+	w := &Worker{
+		Name:  name,
+		Queue: *queue.New(),
+		Db:    db,
+		Store: st,
+	}
+
+	if st != nil {
+		items, err := st.List("tasks")
+		if err == nil {
+			for _, item := range items {
+				var t task.Task
+				if err := json.Unmarshal(item, &t); err == nil {
+					w.Db[t.ID] = &t
+				}
+			}
+			w.TaskCount = len(w.Db)
+			log.Printf("Recovered %d tasks from persistent store for worker %s\n", len(w.Db), name)
+		}
+	}
+
+	return w
 }
 
 // GetTasks returns a slice of all tasks in the worker's in-memory DB.

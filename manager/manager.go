@@ -13,6 +13,7 @@ import (
 
 	"github.com/Shreyas9468/cube/node"
 	"github.com/Shreyas9468/cube/scheduler"
+	"github.com/Shreyas9468/cube/store"
 	"github.com/Shreyas9468/cube/task"
 )
 
@@ -26,6 +27,7 @@ type Manager struct {
 	TaskWorkerMap map[uuid.UUID]string
 	WorkerNodes   []*node.Node
 	Scheduler     scheduler.Scheduler
+	Store         store.Store
 }
 
 // SelectWorker picks the best healthy worker for the given task using the configured Scheduler.
@@ -89,6 +91,7 @@ func (m *Manager) updateTasks() {
 			}
 			if taskList[len(taskList)-1].State != t.State {
 				taskList[len(taskList)-1].State = t.State
+				m.persistTask(taskList[len(taskList)-1])
 			}
 		}
 	}
@@ -115,6 +118,8 @@ func (m *Manager) SendWork() {
 
 		t.State = task.Scheduled
 		m.TaskDb[t.ID] = append(m.TaskDb[t.ID], &t)
+		m.persistTask(&t)
+		m.persistEvent(&te)
 
 		data, err := json.Marshal(te)
 		if err != nil {
@@ -249,6 +254,34 @@ func (m *Manager) maybeRestartTask(t *task.Task, reason string) {
 	}
 }
 
+func (m *Manager) persistTask(t *task.Task) {
+	if m.Store == nil {
+		return
+	}
+	data, err := json.Marshal(t)
+	if err != nil {
+		log.Printf("Error marshalling task %s for persistence: %v\n", t.ID, err)
+		return
+	}
+	if err := m.Store.Put("tasks", t.ID.String(), data); err != nil {
+		log.Printf("Error persisting task %s: %v\n", t.ID, err)
+	}
+}
+
+func (m *Manager) persistEvent(te *task.TaskEvent) {
+	if m.Store == nil {
+		return
+	}
+	data, err := json.Marshal(te)
+	if err != nil {
+		log.Printf("Error marshalling event %s for persistence: %v\n", te.ID, err)
+		return
+	}
+	if err := m.Store.Put("events", te.ID.String(), data); err != nil {
+		log.Printf("Error persisting event %s: %v\n", te.ID, err)
+	}
+}
+
 // ProcessTasks starts send-work, update-tasks, health-checks, and task-reconciliation loops.
 func (m *Manager) ProcessTasks() {
 	go m.SendWorkLoop()
@@ -257,9 +290,13 @@ func (m *Manager) ProcessTasks() {
 	go m.ReconcileTasks()
 }
 
-// New creates a Manager wired with the given workers and scheduler.
+// New creates a Manager wired with the given workers and scheduler without persistent store.
 func New(workers []string, s scheduler.Scheduler) *Manager {
-	// Build node objects from worker address strings.
+	return NewWithStore(workers, s, nil)
+}
+
+// NewWithStore creates a Manager with an optional persistent store, recovering historical state.
+func NewWithStore(workers []string, s scheduler.Scheduler, st store.Store) *Manager {
 	workerNodes := make([]*node.Node, 0, len(workers))
 	for _, w := range workers {
 		workerNodes = append(workerNodes, &node.Node{
@@ -271,14 +308,44 @@ func New(workers []string, s scheduler.Scheduler) *Manager {
 		})
 	}
 
+	taskDb := make(map[uuid.UUID][]*task.Task)
+	eventDb := make(map[uuid.UUID][]*task.TaskEvent)
+	workerTaskMap := make(map[string][]uuid.UUID)
+	taskWorkerMap := make(map[uuid.UUID]string)
+
+	if st != nil {
+		taskItems, err := st.List("tasks")
+		if err == nil {
+			for _, item := range taskItems {
+				var t task.Task
+				if err := json.Unmarshal(item, &t); err == nil {
+					taskDb[t.ID] = append(taskDb[t.ID], &t)
+				}
+			}
+			log.Printf("Recovered %d unique tasks from persistent store\n", len(taskDb))
+		}
+
+		eventItems, err := st.List("events")
+		if err == nil {
+			for _, item := range eventItems {
+				var te task.TaskEvent
+				if err := json.Unmarshal(item, &te); err == nil {
+					eventDb[te.ID] = append(eventDb[te.ID], &te)
+				}
+			}
+			log.Printf("Recovered %d task events from persistent store\n", len(eventDb))
+		}
+	}
+
 	return &Manager{
 		Pending:       *queue.New(),
-		TaskDb:        make(map[uuid.UUID][]*task.Task),
-		EventDb:       make(map[uuid.UUID][]*task.TaskEvent),
+		TaskDb:        taskDb,
+		EventDb:       eventDb,
 		Workers:       workers,
-		WorkerTaskMap: make(map[string][]uuid.UUID),
-		TaskWorkerMap: make(map[uuid.UUID]string),
+		WorkerTaskMap: workerTaskMap,
+		TaskWorkerMap: taskWorkerMap,
 		WorkerNodes:   workerNodes,
 		Scheduler:     s,
+		Store:         st,
 	}
 }

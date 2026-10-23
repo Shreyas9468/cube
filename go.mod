@@ -1,8 +1,6 @@
 module github.com/Shreyas9468/cube
 
-go 1.24
-
-toolchain go1.24.0
+go 1.25.0
 
 require (
 	github.com/c9s/goprocinfo v0.0.0-20210130143923-c95fcf8c64a8
@@ -11,6 +9,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/moby/moby/api v1.56.1
 	github.com/moby/moby/client v0.6.2
+	go.etcd.io/bbolt v1.5.0
 )
 
 require (
@@ -31,5 +30,5 @@ require (
 	go.opentelemetry.io/otel v1.35.0 // indirect
 	go.opentelemetry.io/otel/metric v1.35.0 // indirect
 	go.opentelemetry.io/otel/trace v1.35.0 // indirect
-	golang.org/x/sys v0.33.0 // indirect
+	golang.org/x/sys v0.45.0 // indirect
 )

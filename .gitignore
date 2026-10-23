@@ -1,4 +1,5 @@
 # Binaries
+cubectl
 *.exe
 *.exe~
 *.dll
@@ -8,6 +9,7 @@ bin/
 
 # Database files
 *.db
+data/
 
 # Environment & IDE
 .kilo/

@@ -1,79 +1,98 @@
 # Cube: Distributed Container Orchestrator in Go
 
-Cube is a lightweight container orchestrator built from scratch in Go, inspired by systems like Google Borg, Kubernetes, and HashiCorp Nomad. It demystifies distributed container scheduling and lifecycle management using Go and the Docker Engine API.
+Cube is a production-grade distributed container orchestrator built from scratch in Go, inspired by systems like Google Borg, Kubernetes, and HashiCorp Nomad. It demystifies distributed systems, container scheduling, fault tolerance, and lifecycle management using Go and the Docker Engine API.
 
 ---
 
 ## Architecture Overview
 
-Cube coordinates containerized tasks across worker nodes via a centralized manager and distributed worker daemons.
+Cube coordinates containerized workloads across a cluster of compute nodes via a centralized manager control plane and distributed worker daemons.
 
 ```
-                  +-------------------------+
-                  |       Manager API       |
-                  |     (Port 5556 / HTTP)  |
-                  +------------+------------+
-                               |
-                +--------------+---------------+
-                |                              |
-         [Pending Queue]               [Task / Event DB]
-                |                              |
-                +--------------+---------------+
-                               |
-                   +-----------v-----------+
-                   |  Scheduler (Pluggable)|
-                   |  - Round-Robin        |
-                   |  - EPVM (Cost-Based)  |
-                   +-----------+-----------+
-                               |
-               +---------------+---------------+
-               |                               |
-       +-------v-------+               +-------v-------+
-       |   Worker 1    |               |   Worker 2    |
-       |  (Port 5555)  |               |  (Port 5557)  |
-       +-------+-------+               +-------+-------+
-               |                               |
-        [Docker Engine]                 [Docker Engine]
+                      +-----------------------------+
+                      |       cubectl (CLI)         |
+                      |  (run, stop, status, nodes) |
+                      +--------------+--------------+
+                                     | HTTP REST
+                      +--------------v--------------+
+                      |      Cube Manager API       |
+                      |     (Port 5556 / HTTP)      |
+                      +--------------+--------------+
+                                     |
+               +---------------------+---------------------+
+               |                     |                     |
+      [In-Memory Queue]      [BoltDB Store]       [Reconciler & Probes]
+               |              (manager.db)                 |
+               +---------------------+---------------------+
+                                     |
+                         +-----------v-----------+
+                         |  Scheduler (Pluggable)|
+                         |  - Round-Robin        |
+                         |  - EPVM (Cost-Based)  |
+                         +-----------+-----------+
+                                     |
+                     +---------------+---------------+
+                     |                               |
+             +-------v-------+               +-------v-------+
+             |   Worker 1    |               |   Worker 2    |
+             |  (Port 5555)  |               |  (Port 5557)  |
+             +-------+-------+               +-------+-------+
+                     |                               |
+            [BoltDB / Docker]               [BoltDB / Docker]
 ```
 
-### Core Components
+### Core Subsystems
 
 1. **Task & State Machine (`task/`)**
    - **Task Lifecycle:** `Pending` → `Scheduled` → `Running` → `Completed` / `Failed`.
-   - **Docker Engine Integration:** Programmatic container creation, image pulling, execution, log streaming, and teardown using the Docker Go SDK (`moby/moby/client`).
+   - **Docker Engine Runtime:** Automated container creation, image pulling, execution, log streaming, and teardown via the Docker Go SDK (`moby/moby/client`).
+   - **Restart Policies:** Supports `always`, `on-failure`, and `never` with exponential retry bounds.
 
-2. **Worker Daemon (`worker/`)**
-   - Receives tasks from the manager via HTTP REST API.
-   - Executes container run/stop lifecycles through an internal task queue.
-   - Collects real-time host metrics (CPU utilization, memory usage, disk space, load average) from `/proc` with cross-platform fallback.
+2. **Worker Node Daemon (`worker/`)**
+   - Receives container task events via HTTP REST API.
+   - Executes task lifecycles through an internal asynchronous queue.
+   - Collects live host metrics (CPU utilization, memory usage, disk space, load average) from `/proc` with cross-platform fallback.
+   - Persists local container assignments in an embedded BoltDB instance (`worker.db`).
 
-3. **Cluster Manager (`manager/`)**
-   - Control plane managing cluster state and task routing.
-   - Polls worker nodes every 15 seconds to synchronize runtime container states.
-   - Dispatches pending task events to eligible nodes selected by the scheduler.
+3. **Cluster Manager & Control Plane (`manager/`)**
+   - Orchestrates task placement across registered worker hosts.
+   - Syncs container states from workers every 15 seconds.
+   - Periodically probes node health and automatically reconciles orphaned tasks when nodes fail.
+   - Persists all cluster tasks and events in an embedded BoltDB database (`manager.db`).
 
-4. **Schedulers (`scheduler/`)**
-   - **RoundRobin:** Distributes tasks evenly across registered nodes.
-   - **EPVM (Enhanced Parallel Virtual Machine):** Scores candidate nodes based on available CPU, memory headroom, and current task density to minimize cluster resource contention.
+4. **Pluggable Schedulers (`scheduler/`)**
+   - **RoundRobin:** Distributes tasks sequentially across candidate nodes.
+   - **EPVM (Enhanced Parallel Virtual Machine):** Advanced cost-based scheduler calculating load scores from projected memory usage, CPU load, and task density to place workloads with minimal contention.
 
-5. **Node Registry (`node/`)**
-   - Represents compute hosts in the cluster.
-   - Connects to worker metrics endpoints to assess capacity and health before task placement.
+5. **Fault Tolerance & State Reconciliation (`manager/`)**
+   - Automated health monitoring detects unreachable or partitioned worker nodes.
+   - Automatic rescheduling of failed or interrupted workloads onto surviving healthy nodes according to task restart policies.
+
+6. **Embedded Persistent Storage (`store/`)**
+   - Pluggable storage abstraction backed by transactional BoltDB (`bbolt`).
+   - Guarantees that task history, scheduled events, and cluster topology survive process restarts.
+
+7. **Operator CLI — `cubectl` (`cmd/cubectl/`)**
+   - Dedicated command-line tool with subcommands for running, inspecting, stopping, and monitoring tasks and worker nodes.
 
 ---
 
 ## Phased Build Progression
 
-The repository is structured into distinct, logical phases:
+The repository follows a clean, streamlined phased build structure:
 
-| Phase | Component | Description |
+| Phase | Milestone | Key Features |
 |---|---|---|
-| **Phase 1** | Scaffolding | Module configuration, dependencies, and base layout |
-| **Phase 2** | Task Model | Task definitions, state transitions, and Docker container engine |
+| **Phase 1** | Project Scaffolding | Module configuration, dependencies, and base layout |
+| **Phase 2** | Task Model | Task definitions, state machine validation, and Docker container engine |
 | **Phase 3** | Worker Daemon | Task queue, state machine execution, telemetry metrics, and Worker API |
 | **Phase 4** | Manager Control Plane | Centralized state store, task dispatch loop, and Manager HTTP API |
 | **Phase 5** | Node & Schedulers | Node registry, capacity accounting, Round-Robin and EPVM scheduling |
-| **Phase 6** | Full Orchestrator | End-to-end integration wiring manager, worker daemon, and automated task execution |
+| **Phase 6** | Core Orchestrator | End-to-end integration wiring manager, worker daemon, and automated task execution |
+| **Phase 7** | Fault Tolerance | Node health probing, task failure detection, and automatic state reconciliation |
+| **Phase 8** | Persistent Storage | Embedded BoltDB storage engine for cluster state persistence |
+| **Phase 9** | Operator CLI | `cubectl` tool with `run`, `status`, `stop`, and `nodes` subcommands |
+| **Phase 10** | Production Readiness | Unified binary, sample specs, persistent storage integration, and docs |
 
 ---
 
@@ -86,6 +105,7 @@ The repository is structured into distinct, logical phases:
 | `GET` | `/tasks` | List all tasks across worker nodes |
 | `POST` | `/tasks` | Submit a new task event |
 | `DELETE` | `/tasks/{taskID}` | Stop a running task |
+| `GET` | `/nodes` | List registered worker nodes and health status |
 
 ### Worker API (Default Port: `5555`)
 
@@ -101,10 +121,10 @@ The repository is structured into distinct, logical phases:
 ## Getting Started
 
 ### Prerequisites
-- **Go 1.20+**
+- **Go 1.25+**
 - **Docker Engine** running locally (or remote Docker daemon via `DOCKER_HOST`)
 
-### Running Locally
+### Running the Orchestrator
 
 ```bash
 # Verify dependencies
@@ -113,15 +133,64 @@ go mod tidy
 # Build all packages
 go build ./...
 
-# Run the cluster orchestrator
+# Start the cluster orchestrator
 go run main.go
 ```
 
-When started, `main.go` initializes:
-1. Worker daemon on `0.0.0.0:5555`
-2. Manager control plane on `0.0.0.0:5556` with pluggable scheduler
-3. Background state reconciliation and task dispatch loops
-4. Submits a sample task (`strm/helloworld-http`) and verifies container startup
+When started, `main.go`:
+1. Opens persistent storage in `data/worker.db` and `data/manager.db`.
+2. Starts the worker daemon on `0.0.0.0:5555`.
+3. Starts the manager control plane on `0.0.0.0:5556` with the EPVM cost-based scheduler.
+4. Starts background health-check probes, task dispatch loops, and state reconcilers.
+
+---
+
+## Using `cubectl` CLI
+
+Build the CLI:
+
+```bash
+go build -o cubectl ./cmd/cubectl
+```
+
+### Inspect Cluster Nodes
+```bash
+./cubectl nodes
+```
+```
+NODE NAME     ROLE    STATUS   TASKS  MEMORY (TOTAL)  DISK (TOTAL)
+0.0.0.0:5555  worker  Healthy  1      16384 MB        256 GB
+```
+
+### Run a Task from JSON Specification
+```bash
+./cubectl run -f examples/hello.json
+```
+```
+Task 4a2b9f10-1823-4c91-b3f2-c90a12b489a1 (hello-service) successfully submitted to cluster.
+```
+
+Or run directly via flags:
+```bash
+./cubectl run --name web --image nginx:alpine --cpu 0.5 --memory 536870912 --restart always
+```
+
+### List Cluster Tasks
+```bash
+./cubectl status
+```
+```
+TASK ID   NAME           IMAGE                 STATE    RESTARTS  CONTAINER     STARTED
+4a2b9f10  hello-service  strm/helloworld-http  Running  0         a1b2c3d4e5f6  14:02:18
+```
+
+### Stop a Running Task
+```bash
+./cubectl stop 4a2b9f10-1823-4c91-b3f2-c90a12b489a1
+```
+```
+Stop signal successfully sent for task 4a2b9f10-1823-4c91-b3f2-c90a12b489a1.
+```
 
 ---
 

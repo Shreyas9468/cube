@@ -5,11 +5,11 @@ import (
 	"os"
 	"time"
 
-	"github.com/golang-collections/collections/queue"
 	"github.com/google/uuid"
 
 	"github.com/Shreyas9468/cube/manager"
 	"github.com/Shreyas9468/cube/scheduler"
+	"github.com/Shreyas9468/cube/store"
 	"github.com/Shreyas9468/cube/task"
 	"github.com/Shreyas9468/cube/worker"
 )
@@ -21,18 +21,29 @@ func main() {
 	mhost := "0.0.0.0"
 	mport := 5556
 
-	fmt.Println("Starting Cube worker")
-	w := worker.Worker{
-		Name:  "worker-1",
-		Queue: *queue.New(),
-		Db:    make(map[uuid.UUID]*task.Task),
+	// Initialize persistent storage for worker and manager
+	wStore, err := store.NewBoltStore("data/worker.db", 0600, []string{"tasks"})
+	if err != nil {
+		fmt.Printf("Notice: starting worker in in-memory storage mode (%v)\n", err)
+	} else {
+		defer wStore.Close()
 	}
-	wApi := worker.Api{Address: whost, Port: wport, Worker: &w}
 
-	fmt.Println("Starting Cube manager with scheduler")
+	mStore, err := store.NewBoltStore("data/manager.db", 0600, []string{"tasks", "events"})
+	if err != nil {
+		fmt.Printf("Notice: starting manager in in-memory storage mode (%v)\n", err)
+	} else {
+		defer mStore.Close()
+	}
+
+	fmt.Println("Starting Cube worker daemon")
+	w := worker.New("worker-1", wStore)
+	wApi := worker.Api{Address: whost, Port: wport, Worker: w}
+
+	fmt.Println("Starting Cube cluster manager with EPVM scheduler")
 	workers := []string{fmt.Sprintf("%s:%d", whost, wport)}
-	s := &scheduler.RoundRobin{Name: "roundrobin"}
-	m := manager.New(workers, s)
+	s := &scheduler.Epvm{Name: "epvm"}
+	m := manager.NewWithStore(workers, s, mStore)
 	mApi := manager.Api{Address: mhost, Port: mport, Manager: m}
 
 	go w.RunTaskLoop()
@@ -42,21 +53,22 @@ func main() {
 
 	time.Sleep(time.Millisecond * 500)
 
-	// Submit a test task via the manager.
+	// Submit an initial sample task via the manager control plane
 	testTask := task.Task{
-		ID:    uuid.New(),
-		Name:  "cube-task-sample",
-		State: task.Scheduled,
-		Image: "strm/helloworld-http",
+		ID:            uuid.New(),
+		Name:          "cube-task-sample",
+		State:         task.Scheduled,
+		Image:         "strm/helloworld-http",
+		RestartPolicy: task.RestartPolicyOnFailure,
 	}
 	te := task.TaskEvent{
 		ID:        uuid.New(),
 		State:     task.Running,
-		Timestamp: time.Now(),
+		Timestamp: time.Now().UTC(),
 		Task:      testTask,
 	}
 	m.AddTask(te)
-	fmt.Printf("Submitted task %s to manager\n", testTask.ID)
+	fmt.Printf("Submitted task %s to manager queue\n", testTask.ID)
 
 	fmt.Printf("Manager API listening on %s:%d\n", mhost, mport)
 	fmt.Printf("Worker  API listening on %s:%d\n", whost, wport)

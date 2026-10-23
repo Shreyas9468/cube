@@ -28,11 +28,21 @@ type Manager struct {
 	Scheduler     scheduler.Scheduler
 }
 
-// SelectWorker picks the best worker for the given task using the configured Scheduler.
+// SelectWorker picks the best healthy worker for the given task using the configured Scheduler.
 func (m *Manager) SelectWorker(t task.Task) (*node.Node, error) {
-	candidates := m.Scheduler.SelectCandidateNodes(t, m.WorkerNodes)
-	if candidates == nil {
-		return nil, fmt.Errorf("no available candidates match resource request for task %v", t.ID)
+	var healthyNodes []*node.Node
+	for _, n := range m.WorkerNodes {
+		if n.Healthy {
+			healthyNodes = append(healthyNodes, n)
+		}
+	}
+	if len(healthyNodes) == 0 {
+		return nil, fmt.Errorf("no healthy worker nodes currently available in cluster")
+	}
+
+	candidates := m.Scheduler.SelectCandidateNodes(t, healthyNodes)
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no available candidate nodes match resource request for task %v", t.ID)
 	}
 	scores := m.Scheduler.Score(t, candidates)
 	selectedNode := m.Scheduler.Pick(scores, candidates)
@@ -155,10 +165,96 @@ func (m *Manager) SendWorkLoop() {
 	}
 }
 
-// ProcessTasks starts both the send-work and update-tasks loops.
+// DoHealthChecks runs a background loop to verify connectivity and health of all worker nodes.
+func (m *Manager) DoHealthChecks() {
+	for {
+		log.Println("Performing health checks on worker nodes")
+		for _, n := range m.WorkerNodes {
+			if err := n.GetStats(); err != nil {
+				log.Printf("Health check failed for node %s: %v\n", n.Name, err)
+				n.Healthy = false
+			} else {
+				n.Healthy = true
+			}
+		}
+		time.Sleep(15 * time.Second)
+	}
+}
+
+// ReconcileTasks reconciles task state against node health and auto-recovers failed tasks.
+func (m *Manager) ReconcileTasks() {
+	for {
+		time.Sleep(20 * time.Second)
+		log.Println("Reconciling cluster tasks and assessing restart policies")
+		m.reconcile()
+	}
+}
+
+func (m *Manager) reconcile() {
+	nodeHealth := make(map[string]bool)
+	for _, n := range m.WorkerNodes {
+		nodeHealth[n.Name] = n.Healthy
+	}
+
+	for taskID, workerName := range m.TaskWorkerMap {
+		taskList, ok := m.TaskDb[taskID]
+		if !ok || len(taskList) == 0 {
+			continue
+		}
+		latestTask := taskList[len(taskList)-1]
+
+		// Condition 1: Node assigned to the task is unhealthy
+		isNodeHealthy := nodeHealth[workerName]
+		if !isNodeHealthy && (latestTask.State == task.Running || latestTask.State == task.Scheduled) {
+			log.Printf("Worker %s hosting task %s is unhealthy. Initiating reconciliation.\n", workerName, latestTask.ID)
+			m.maybeRestartTask(latestTask, "node_failure")
+			continue
+		}
+
+		// Condition 2: Task has failed unexpectedly
+		if latestTask.State == task.Failed {
+			m.maybeRestartTask(latestTask, "task_failed")
+		}
+	}
+}
+
+func (m *Manager) maybeRestartTask(t *task.Task, reason string) {
+	const maxRetries = 3
+	shouldRestart := false
+
+	switch t.RestartPolicy {
+	case task.RestartPolicyAlways:
+		shouldRestart = true
+	case task.RestartPolicyOnFailure:
+		if reason == "task_failed" || reason == "node_failure" {
+			shouldRestart = true
+		}
+	}
+
+	if shouldRestart && t.RestartCount < maxRetries {
+		t.RestartCount++
+		log.Printf("Restarting task %s (attempt %d/%d, reason: %s)\n", t.ID, t.RestartCount, maxRetries, reason)
+		retryTask := *t
+		retryTask.State = task.Scheduled
+		retryEvent := task.TaskEvent{
+			ID:        uuid.New(),
+			State:     task.Scheduled,
+			Timestamp: time.Now().UTC(),
+			Task:      retryTask,
+		}
+		m.AddTask(retryEvent)
+	} else if shouldRestart {
+		log.Printf("Task %s exceeded max retry limit of %d. Marked as permanently failed.\n", t.ID, maxRetries)
+		t.State = task.Failed
+	}
+}
+
+// ProcessTasks starts send-work, update-tasks, health-checks, and task-reconciliation loops.
 func (m *Manager) ProcessTasks() {
 	go m.SendWorkLoop()
 	go m.UpdateTasks()
+	go m.DoHealthChecks()
+	go m.ReconcileTasks()
 }
 
 // New creates a Manager wired with the given workers and scheduler.
@@ -167,10 +263,11 @@ func New(workers []string, s scheduler.Scheduler) *Manager {
 	workerNodes := make([]*node.Node, 0, len(workers))
 	for _, w := range workers {
 		workerNodes = append(workerNodes, &node.Node{
-			Name: w,
-			Ip:   w,
-			Api:  w,
-			Role: "worker",
+			Name:    w,
+			Ip:      w,
+			Api:     w,
+			Role:    "worker",
+			Healthy: true,
 		})
 	}
 

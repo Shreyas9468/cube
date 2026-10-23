@@ -26,6 +26,12 @@ const (
 	Failed
 )
 
+const (
+	RestartPolicyAlways    = "always"
+	RestartPolicyOnFailure = "on-failure"
+	RestartPolicyNever     = "never"
+)
+
 // Task is the smallest unit of work in the Cube orchestration system.
 type Task struct {
 	ID            uuid.UUID
@@ -39,6 +45,7 @@ type Task struct {
 	ExposedPorts  network.PortSet
 	PortBindings  map[string]string
 	RestartPolicy string
+	RestartCount  int
 	StartTime     time.Time
 	FinishTime    time.Time
 }

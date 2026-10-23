@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"time"
 )
 
 // Node represents a worker host in the cluster.
@@ -21,6 +22,8 @@ type Node struct {
 	Stats           NodeStats
 	Role            string
 	TaskCount       int
+	Healthy         bool
+	LastSeen        time.Time
 }
 
 // NodeStats holds the latest resource metrics retrieved from the worker API.
@@ -86,27 +89,34 @@ func (n *Node) GetStats() error {
 	url := fmt.Sprintf("%s/stats", n.Api)
 	resp, err := http.Get(url)
 	if err != nil {
+		n.Healthy = false
 		return fmt.Errorf("unable to connect to %s: %w", n.Api, err)
 	}
 
 	if resp.StatusCode != 200 {
+		n.Healthy = false
 		return fmt.Errorf("error retrieving stats from %s: %d", n.Api, resp.StatusCode)
 	}
 
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		n.Healthy = false
 		return fmt.Errorf("error reading response body: %w", err)
 	}
 
 	var stats NodeStats
 	if err = json.Unmarshal(body, &stats); err != nil {
+		n.Healthy = false
 		return fmt.Errorf("error unmarshalling stats: %w", err)
 	}
 
 	n.Stats = stats
 	n.Memory = int64(stats.MemStats.MemTotal)
 	n.Disk = int64(stats.DiskStats.All)
+	n.TaskCount = stats.TaskCount
+	n.Healthy = true
+	n.LastSeen = time.Now().UTC()
 
 	return nil
 }

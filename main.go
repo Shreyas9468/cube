@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/Shreyas9468/cube/manager"
+	"github.com/Shreyas9468/cube/scheduler"
 	"github.com/Shreyas9468/cube/task"
 	"github.com/Shreyas9468/cube/worker"
 )
@@ -28,9 +29,10 @@ func main() {
 	}
 	wApi := worker.Api{Address: whost, Port: wport, Worker: &w}
 
-	fmt.Println("Starting Cube manager")
+	fmt.Println("Starting Cube manager with scheduler")
 	workers := []string{fmt.Sprintf("%s:%d", whost, wport)}
-	m := manager.New(workers)
+	s := &scheduler.RoundRobin{Name: "roundrobin"}
+	m := manager.New(workers, s)
 	mApi := manager.Api{Address: mhost, Port: mport, Manager: m}
 
 	go w.RunTaskLoop()
@@ -38,13 +40,12 @@ func main() {
 	go m.ProcessTasks()
 	go wApi.Start()
 
-	// Give the worker API a moment to bind.
 	time.Sleep(time.Millisecond * 500)
 
-	// Submit a test task via the manager's in-memory queue.
+	// Submit a test task via the manager.
 	testTask := task.Task{
 		ID:    uuid.New(),
-		Name:  "test-chapter-5",
+		Name:  "cube-task-sample",
 		State: task.Scheduled,
 		Image: "strm/helloworld-http",
 	}
@@ -58,8 +59,8 @@ func main() {
 	fmt.Printf("Submitted task %s to manager\n", testTask.ID)
 
 	fmt.Printf("Manager API listening on %s:%d\n", mhost, mport)
-	fmt.Printf("Worker API listening on %s:%d\n", whost, wport)
-	fmt.Fprintf(os.Stdout, "Press Ctrl-C to stop.\n")
+	fmt.Printf("Worker  API listening on %s:%d\n", whost, wport)
+	fmt.Fprintln(os.Stdout, "Press Ctrl-C to stop.")
 
 	mApi.Start()
 }

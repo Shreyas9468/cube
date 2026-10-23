@@ -11,11 +11,12 @@ import (
 	"github.com/golang-collections/collections/queue"
 	"github.com/google/uuid"
 
+	"github.com/Shreyas9468/cube/node"
+	"github.com/Shreyas9468/cube/scheduler"
 	"github.com/Shreyas9468/cube/task"
-	"github.com/Shreyas9468/cube/worker"
 )
 
-// Manager orchestrates tasks across a set of worker nodes.
+// Manager orchestrates tasks across a set of worker nodes using a pluggable Scheduler.
 type Manager struct {
 	Pending       queue.Queue
 	TaskDb        map[uuid.UUID][]*task.Task
@@ -23,23 +24,22 @@ type Manager struct {
 	Workers       []string
 	WorkerTaskMap map[string][]uuid.UUID
 	TaskWorkerMap map[uuid.UUID]string
-	LastWorker    int
+	WorkerNodes   []*node.Node
+	Scheduler     scheduler.Scheduler
 }
 
-// SelectWorker uses a round-robin strategy to pick the next worker.
-func (m *Manager) SelectWorker() string {
-	var newWorker int
-	if m.LastWorker+1 < len(m.Workers) {
-		newWorker = m.LastWorker + 1
-		m.LastWorker++
-	} else {
-		newWorker = 0
-		m.LastWorker = 0
+// SelectWorker picks the best worker for the given task using the configured Scheduler.
+func (m *Manager) SelectWorker(t task.Task) (*node.Node, error) {
+	candidates := m.Scheduler.SelectCandidateNodes(t, m.WorkerNodes)
+	if candidates == nil {
+		return nil, fmt.Errorf("no available candidates match resource request for task %v", t.ID)
 	}
-	return m.Workers[newWorker]
+	scores := m.Scheduler.Score(t, candidates)
+	selectedNode := m.Scheduler.Pick(scores, candidates)
+	return selectedNode, nil
 }
 
-// UpdateTasks polls every worker and refreshes task state in the local DB.
+// UpdateTasks polls every worker every 15 s and syncs task state into TaskDb.
 func (m *Manager) UpdateTasks() {
 	for {
 		log.Println("Checking for task updates from workers")
@@ -57,32 +57,26 @@ func (m *Manager) updateTasks() {
 			log.Printf("Error connecting to %v: %v\n", worker, err)
 			continue
 		}
-
 		if resp.StatusCode != http.StatusOK {
-			log.Printf("Error sending request: %v\n", err)
+			log.Printf("Unexpected status from %v: %d\n", worker, resp.StatusCode)
 			continue
 		}
 
 		var tasks []*task.Task
 		if err = json.NewDecoder(resp.Body).Decode(&tasks); err != nil {
-			log.Printf("Error unmarshalling tasks: %v\n", err)
+			log.Printf("Error unmarshalling tasks from %s: %v\n", worker, err)
 			continue
 		}
 
 		for _, t := range tasks {
-			log.Printf("Attempting to update task %v\n", t.ID)
-			_, ok := m.TaskWorkerMap[t.ID]
-			if !ok {
-				log.Printf("Task with ID %s not found\n", t.ID)
+			if _, ok := m.TaskWorkerMap[t.ID]; !ok {
+				log.Printf("Task %s not found in TaskWorkerMap\n", t.ID)
 				continue
 			}
-
-			if m.TaskDb[t.ID] == nil || len(m.TaskDb[t.ID]) == 0 {
-				log.Printf("Task %s not found in DB\n", t.ID)
-				continue
-			}
-
 			taskList := m.TaskDb[t.ID]
+			if len(taskList) == 0 {
+				continue
+			}
 			if taskList[len(taskList)-1].State != t.State {
 				taskList[len(taskList)-1].State = t.State
 			}
@@ -90,14 +84,20 @@ func (m *Manager) updateTasks() {
 	}
 }
 
-// SendWork picks a worker and sends the next pending TaskEvent to it.
+// SendWork dequeues the next pending TaskEvent, selects a worker, and dispatches the task.
 func (m *Manager) SendWork() {
 	if m.Pending.Len() > 0 {
-		w := m.SelectWorker()
 		e := m.Pending.Dequeue()
 		te := e.(task.TaskEvent)
 		t := te.Task
 		log.Printf("Pulled %v off pending queue\n", t)
+
+		selectedNode, err := m.SelectWorker(t)
+		if err != nil {
+			log.Printf("Error selecting worker for task %s: %v\n", t.ID, err)
+			return
+		}
+		w := selectedNode.Name
 
 		m.EventDb[te.ID] = append(m.EventDb[te.ID], &te)
 		m.WorkerTaskMap[w] = append(m.WorkerTaskMap[w], t.ID)
@@ -108,7 +108,7 @@ func (m *Manager) SendWork() {
 
 		data, err := json.Marshal(te)
 		if err != nil {
-			log.Printf("Unable to marshal task object: %v\n", te)
+			log.Printf("Unable to marshal TaskEvent: %v\n", err)
 			return
 		}
 
@@ -123,32 +123,30 @@ func (m *Manager) SendWork() {
 		var result task.DockerResult
 		if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
 			log.Printf("Error decoding response: %v\n", err)
-			return
 		}
-
 		log.Printf("Response from worker: %v\n", result)
 	} else {
 		log.Println("No work in the queue")
 	}
 }
 
-// AddTask enqueues a new TaskEvent for the manager to send to workers.
+// AddTask enqueues a new TaskEvent for the manager to dispatch.
 func (m *Manager) AddTask(te task.TaskEvent) {
 	m.Pending.Enqueue(te)
 }
 
-// GetTasks collects the latest version of every task across all workers.
+// GetTasks returns the latest snapshot of every known task.
 func (m *Manager) GetTasks() []*task.Task {
-	tasks := []*task.Task{}
-	for _, workerTasks := range m.TaskDb {
-		for _, t := range workerTasks {
+	var tasks []*task.Task
+	for _, taskList := range m.TaskDb {
+		for _, t := range taskList {
 			tasks = append(tasks, t)
 		}
 	}
 	return tasks
 }
 
-// SendWorkLoop continuously processes pending work every 10 seconds.
+// SendWorkLoop processes pending work every 10 s.
 func (m *Manager) SendWorkLoop() {
 	for {
 		log.Println("Sending work to workers")
@@ -157,34 +155,33 @@ func (m *Manager) SendWorkLoop() {
 	}
 }
 
-// ProcessTasks runs both the send-work loop and the update-tasks loop.
+// ProcessTasks starts both the send-work and update-tasks loops.
 func (m *Manager) ProcessTasks() {
 	go m.SendWorkLoop()
 	go m.UpdateTasks()
 }
 
-// New creates a Manager with the given workers.
-func New(workers []string) *Manager {
-	taskDb := make(map[uuid.UUID][]*task.Task)
-	eventDb := make(map[uuid.UUID][]*task.TaskEvent)
-	workerTaskMap := make(map[string][]uuid.UUID)
-	taskWorkerMap := make(map[uuid.UUID]string)
+// New creates a Manager wired with the given workers and scheduler.
+func New(workers []string, s scheduler.Scheduler) *Manager {
+	// Build node objects from worker address strings.
+	workerNodes := make([]*node.Node, 0, len(workers))
+	for _, w := range workers {
+		workerNodes = append(workerNodes, &node.Node{
+			Name: w,
+			Ip:   w,
+			Api:  w,
+			Role: "worker",
+		})
+	}
 
 	return &Manager{
 		Pending:       *queue.New(),
-		TaskDb:        taskDb,
-		EventDb:       eventDb,
+		TaskDb:        make(map[uuid.UUID][]*task.Task),
+		EventDb:       make(map[uuid.UUID][]*task.TaskEvent),
 		Workers:       workers,
-		WorkerTaskMap: workerTaskMap,
-		TaskWorkerMap: taskWorkerMap,
+		WorkerTaskMap: make(map[string][]uuid.UUID),
+		TaskWorkerMap: make(map[uuid.UUID]string),
+		WorkerNodes:   workerNodes,
+		Scheduler:     s,
 	}
-}
-
-// WorkerNode wraps a worker client to talk to a remote worker node.
-type WorkerNode struct {
-	Name    string
-	Api     *worker.Api
-	Client  *http.Client
-	Address string
-	Port    int
 }

@@ -74,7 +74,23 @@ func main() {
 		RunE:    listNodes,
 	}
 
-	rootCmd.AddCommand(runCmd, statusCmd, stopCmd, nodesCmd)
+	// inspect command
+	inspectCmd := &cobra.Command{
+		Use:   "inspect <task-id>",
+		Short: "Display detailed task metadata and execution status",
+		Args:  cobra.ExactArgs(1),
+		RunE:  inspectTask,
+	}
+
+	// logs command
+	logsCmd := &cobra.Command{
+		Use:   "logs <task-id>",
+		Short: "Fetch and display container logs for a task",
+		Args:  cobra.ExactArgs(1),
+		RunE:  getTaskLogs,
+	}
+
+	rootCmd.AddCommand(runCmd, statusCmd, stopCmd, nodesCmd, inspectCmd, logsCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -254,4 +270,47 @@ func stateToString(s task.State) string {
 	default:
 		return "Unknown"
 	}
+}
+
+func inspectTask(cmd *cobra.Command, args []string) error {
+	taskID := args[0]
+	resp, err := http.Get(fmt.Sprintf("http://%s/tasks/%s", managerAddr, taskID))
+	if err != nil {
+		return fmt.Errorf("failed to contact manager at %s: %w", managerAddr, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("manager returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, body, "", "  "); err != nil {
+		fmt.Println(string(body))
+		return nil
+	}
+	fmt.Println(pretty.String())
+	return nil
+}
+
+func getTaskLogs(cmd *cobra.Command, args []string) error {
+	taskID := args[0]
+	resp, err := http.Get(fmt.Sprintf("http://%s/tasks/%s/logs", managerAddr, taskID))
+	if err != nil {
+		return fmt.Errorf("failed to contact manager at %s: %w", managerAddr, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("manager returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	_, err = io.Copy(os.Stdout, resp.Body)
+	return err
 }

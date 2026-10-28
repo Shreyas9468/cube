@@ -180,3 +180,17 @@ func (w *Worker) GetTasks() []*task.Task {
 	}
 	return tasks
 }
+
+// GetLogs retrieves stdout/stderr logs for a given task's container.
+func (w *Worker) GetLogs(taskID uuid.UUID) ([]byte, error) {
+	t, ok := w.Db[taskID]
+	if !ok {
+		return nil, fmt.Errorf("task %s not found on worker", taskID)
+	}
+	if t.ContainerID == "" {
+		return nil, fmt.Errorf("task %s has no active container", taskID)
+	}
+	cfg := task.NewConfig(t)
+	d := task.NewDocker(cfg)
+	return d.Logs(t.ContainerID)
+}

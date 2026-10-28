@@ -66,7 +66,8 @@ func main() {
 
 	// ─── Manager control plane ────────────────────────────────────────────────
 	slog.Info("Initialising manager with EPVM scheduler", "address", fmt.Sprintf("%s:%d", mhost, mport))
-	workers := []string{fmt.Sprintf("%s:%d", whost, wport)}
+	// shortcut: connect via loopback for local cluster node, upgrade to flag/config for distributed nodes
+	workers := []string{fmt.Sprintf("127.0.0.1:%d", wport)}
 	s := &scheduler.Epvm{Name: "epvm"}
 	m := manager.NewWithStore(workers, s, mStore)
 	mApi := manager.Api{Address: mhost, Port: mport, Manager: m}

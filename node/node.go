@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -86,16 +87,23 @@ func New(name, api, role string) (*Node, error) {
 
 // GetStats fetches the latest stats from the node's /stats endpoint.
 func (n *Node) GetStats() error {
-	url := fmt.Sprintf("%s/stats", n.Api)
+	api := n.Api
+	if !strings.HasPrefix(api, "http://") && !strings.HasPrefix(api, "https://") {
+		api = "http://" + api
+	}
+	// shortcut: normalize 0.0.0.0 to 127.0.0.1 for local dialing on Windows, upgrade to config for remote nodes
+	api = strings.Replace(api, "http://0.0.0.0:", "http://127.0.0.1:", 1)
+	api = strings.Replace(api, "https://0.0.0.0:", "https://127.0.0.1:", 1)
+	url := fmt.Sprintf("%s/stats", api)
 	resp, err := http.Get(url)
 	if err != nil {
 		n.Healthy = false
-		return fmt.Errorf("unable to connect to %s: %w", n.Api, err)
+		return fmt.Errorf("unable to connect to %s: %w", api, err)
 	}
 
 	if resp.StatusCode != 200 {
 		n.Healthy = false
-		return fmt.Errorf("error retrieving stats from %s: %d", n.Api, resp.StatusCode)
+		return fmt.Errorf("error retrieving stats from %s: %d", api, resp.StatusCode)
 	}
 
 	defer resp.Body.Close()

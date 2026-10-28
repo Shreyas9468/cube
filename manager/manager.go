@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/golang-collections/collections/queue"
@@ -63,7 +64,8 @@ func (m *Manager) UpdateTasks() {
 func (m *Manager) updateTasks() {
 	for _, worker := range m.Workers {
 		slog.Debug("Polling worker", "worker", worker)
-		url := fmt.Sprintf("http://%s/tasks", worker)
+		workerAddr := normalizeAddr(worker)
+		url := fmt.Sprintf("http://%s/tasks", workerAddr)
 		resp, err := http.Get(url)
 		if err != nil {
 			slog.Warn("Failed to connect to worker", "worker", worker, "error", err)
@@ -71,11 +73,14 @@ func (m *Manager) updateTasks() {
 		}
 		if resp.StatusCode != http.StatusOK {
 			slog.Warn("Unexpected status from worker", "worker", worker, "status", resp.StatusCode)
+			resp.Body.Close()
 			continue
 		}
 
 		var tasks []*task.Task
-		if err = json.NewDecoder(resp.Body).Decode(&tasks); err != nil {
+		err = json.NewDecoder(resp.Body).Decode(&tasks)
+		resp.Body.Close()
+		if err != nil {
 			slog.Error("Failed to decode tasks from worker", "worker", worker, "error", err)
 			continue
 		}
@@ -110,6 +115,11 @@ func (m *Manager) SendWork() {
 		t := te.Task
 		slog.Info("Dispatching task from pending queue", "task_id", t.ID, "image", t.Image)
 
+		if te.State == task.Completed || t.State == task.Completed {
+			m.stopWork(te)
+			return
+		}
+
 		selectedNode, err := m.SelectWorker(t)
 		if err != nil {
 			slog.Error("Worker selection failed", "task_id", t.ID, "error", err)
@@ -127,19 +137,24 @@ func (m *Manager) SendWork() {
 		m.persistTask(&t)
 		m.persistEvent(&te)
 
+		selectedNode.MemoryAllocated += t.Memory
+		selectedNode.DiskAllocated += t.Disk
+
 		data, err := json.Marshal(te)
 		if err != nil {
 			slog.Error("Failed to marshal TaskEvent", "task_id", t.ID, "error", err)
 			return
 		}
 
-		url := fmt.Sprintf("http://%s/tasks", w)
+		workerAddr := normalizeAddr(w)
+		url := fmt.Sprintf("http://%s/tasks", workerAddr)
 		resp, err := http.Post(url, "application/json", bytes.NewBuffer(data))
 		if err != nil {
 			slog.Error("Failed to send task to worker", "task_id", t.ID, "worker", w, "error", err)
 			m.Pending.Enqueue(te)
 			return
 		}
+		defer resp.Body.Close()
 
 		var result task.DockerResult
 		if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -149,6 +164,56 @@ func (m *Manager) SendWork() {
 	} else {
 		slog.Debug("Pending queue empty — nothing to dispatch")
 	}
+}
+
+func (m *Manager) stopWork(te task.TaskEvent) {
+	t := te.Task
+	w, ok := m.TaskWorkerMap[t.ID]
+	if !ok {
+		slog.Warn("Task not mapped to any worker for stop", "task_id", t.ID)
+		return
+	}
+
+	slog.Info("Stopping task on worker", "task_id", t.ID, "worker", w)
+	workerAddr := normalizeAddr(w)
+	req, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("http://%s/tasks/%s", workerAddr, t.ID), nil)
+	if err != nil {
+		slog.Error("Failed to create stop request", "task_id", t.ID, "error", err)
+		return
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		slog.Error("Failed to send stop request to worker", "task_id", t.ID, "worker", w, "error", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	t.State = task.Completed
+	m.TaskDb[t.ID] = append(m.TaskDb[t.ID], &t)
+	m.EventDb[te.ID] = append(m.EventDb[te.ID], &te)
+	m.persistTask(&t)
+	m.persistEvent(&te)
+
+	for _, n := range m.WorkerNodes {
+		if n.Name == w {
+			if n.MemoryAllocated >= t.Memory {
+				n.MemoryAllocated -= t.Memory
+			}
+			if n.DiskAllocated >= t.Disk {
+				n.DiskAllocated -= t.Disk
+			}
+			break
+		}
+	}
+	slog.Info("Task stop completed", "task_id", t.ID, "worker", w)
+}
+
+// shortcut: normalize 0.0.0.0 to 127.0.0.1 for local dialing on Windows, upgrade to config for remote nodes
+func normalizeAddr(addr string) string {
+	if strings.HasPrefix(addr, "0.0.0.0:") {
+		return "127.0.0.1:" + strings.TrimPrefix(addr, "0.0.0.0:")
+	}
+	return addr
 }
 
 // AddTask enqueues a new TaskEvent for the manager to dispatch.

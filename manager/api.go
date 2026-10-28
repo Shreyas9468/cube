@@ -33,6 +33,8 @@ func (a *Api) BuildRouter() http.Handler {
 	// ── Routes ────────────────────────────────────────────────────────────────
 	r.Get("/health", a.HealthHandler)
 	r.Get("/tasks", a.GetTasksHandler)
+	r.Get("/tasks/{taskID}", a.GetTaskHandler)
+	r.Get("/tasks/{taskID}/logs", a.GetLogsHandler)
 	r.Post("/tasks", a.StartTaskHandler)
 	r.Delete("/tasks/{taskID}", a.StopTaskHandler)
 	r.Get("/nodes", a.GetNodesHandler)

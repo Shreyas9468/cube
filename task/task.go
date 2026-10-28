@@ -1,6 +1,7 @@
 package task
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -200,4 +201,24 @@ func (d *Docker) Stop(id string) DockerResult {
 
 	slog.Info("Container removed", "container_id", id)
 	return DockerResult{Action: "stop", Result: "success", Error: nil}
+}
+
+// Logs fetches container output (stdout & stderr) for the given container ID.
+func (d *Docker) Logs(id string) ([]byte, error) {
+	ctx := context.Background()
+	out, err := d.Client.ContainerLogs(ctx, id, client.ContainerLogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer out.Close()
+
+	var buf bytes.Buffer
+	if _, err := stdcopy.StdCopy(&buf, &buf, out); err != nil {
+		// shortcut: non-multiplexed fallback for TTY-enabled containers, upgrade if binary logs needed
+		return io.ReadAll(out)
+	}
+	return buf.Bytes(), nil
 }

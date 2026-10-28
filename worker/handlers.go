@@ -81,3 +81,42 @@ func (a *Api) GetStatsHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(200)
 	json.NewEncoder(w).Encode(a.Worker.Stats)
 }
+
+// GetTaskHandler returns a single task by ID.
+func (a *Api) GetTaskHandler(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskID")
+	tID, err := uuid.Parse(taskID)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrResponse{HttpStatusCode: 400, Message: "invalid task ID"})
+		return
+	}
+	t, ok := a.Worker.Db[tID]
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(ErrResponse{HttpStatusCode: 404, Message: "task not found"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(t)
+}
+
+// GetLogsHandler returns container logs for a task.
+func (a *Api) GetLogsHandler(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskID")
+	tID, err := uuid.Parse(taskID)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrResponse{HttpStatusCode: 400, Message: "invalid task ID"})
+		return
+	}
+	logs, err := a.Worker.GetLogs(tID)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(ErrResponse{HttpStatusCode: 404, Message: err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write(logs)
+}

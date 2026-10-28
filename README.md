@@ -102,18 +102,24 @@ The repository follows a clean, streamlined phased build structure:
 
 | Method | Endpoint | Description |
 |---|---|---|
+| `GET` | `/health` | Cluster control plane health and registered node counts |
 | `GET` | `/tasks` | List all tasks across worker nodes |
+| `GET` | `/tasks/{taskID}` | Inspect detailed metadata and status for a specific task |
+| `GET` | `/tasks/{taskID}/logs` | Stream container stdout/stderr logs from worker node |
 | `POST` | `/tasks` | Submit a new task event |
-| `DELETE` | `/tasks/{taskID}` | Stop a running task |
-| `GET` | `/nodes` | List registered worker nodes and health status |
+| `DELETE` | `/tasks/{taskID}` | Stop a running task and reclaim allocated node resources |
+| `GET` | `/nodes` | List registered worker nodes and live health status |
 
 ### Worker API (Default Port: `5555`)
 
 | Method | Endpoint | Description |
 |---|---|---|
+| `GET` | `/health` | Worker health status, name, and active container count |
 | `GET` | `/tasks` | List tasks assigned to this worker |
-| `POST` | `/tasks` | Accept and enqueue a task |
-| `DELETE` | `/tasks/{taskID}` | Stop and remove a task container |
+| `GET` | `/tasks/{taskID}` | Inspect local task container details |
+| `GET` | `/tasks/{taskID}/logs` | Fetch container stdout/stderr output |
+| `POST` | `/tasks` | Accept and enqueue a task event |
+| `DELETE` | `/tasks/{taskID}` | Stop and remove task container |
 | `GET` | `/stats` | Retrieve node resource metrics (CPU, RAM, Disk, Load) |
 
 ---
@@ -130,8 +136,12 @@ The repository follows a clean, streamlined phased build structure:
 # Verify dependencies
 go mod tidy
 
-# Build all packages
-go build ./...
+# Run test suite with race detector
+go test -race ./...
+
+# Build all binaries
+make build
+make build-ctl
 
 # Start the cluster orchestrator
 go run main.go
@@ -150,12 +160,12 @@ When started, `main.go`:
 Build the CLI:
 
 ```bash
-go build -o cubectl ./cmd/cubectl
+go build -o bin/cubectl ./cmd/cubectl
 ```
 
 ### Inspect Cluster Nodes
 ```bash
-./cubectl nodes
+./bin/cubectl nodes
 ```
 ```
 NODE NAME     ROLE    STATUS   TASKS  MEMORY (TOTAL)  DISK (TOTAL)
@@ -164,7 +174,7 @@ NODE NAME     ROLE    STATUS   TASKS  MEMORY (TOTAL)  DISK (TOTAL)
 
 ### Run a Task from JSON Specification
 ```bash
-./cubectl run -f examples/hello.json
+./bin/cubectl run -f examples/hello.json
 ```
 ```
 Task 4a2b9f10-1823-4c91-b3f2-c90a12b489a1 (hello-service) successfully submitted to cluster.
@@ -172,25 +182,45 @@ Task 4a2b9f10-1823-4c91-b3f2-c90a12b489a1 (hello-service) successfully submitted
 
 Or run directly via flags:
 ```bash
-./cubectl run --name web --image nginx:alpine --cpu 0.5 --memory 536870912 --restart always
+./bin/cubectl run --name web --image nginx:alpine --cpu 0.5 --memory 536870912 --restart always
 ```
 
 ### List Cluster Tasks
 ```bash
-./cubectl status
+./bin/cubectl status
 ```
 ```
 TASK ID   NAME           IMAGE                 STATE    RESTARTS  CONTAINER     STARTED
 4a2b9f10  hello-service  strm/helloworld-http  Running  0         a1b2c3d4e5f6  14:02:18
 ```
 
+### Inspect Task Details
+```bash
+./bin/cubectl inspect 4a2b9f10-1823-4c91-b3f2-c90a12b489a1
+```
+
+### View Task Container Logs
+```bash
+./bin/cubectl logs 4a2b9f10-1823-4c91-b3f2-c90a12b489a1
+```
+
 ### Stop a Running Task
 ```bash
-./cubectl stop 4a2b9f10-1823-4c91-b3f2-c90a12b489a1
+./bin/cubectl stop 4a2b9f10-1823-4c91-b3f2-c90a12b489a1
 ```
 ```
 Stop signal successfully sent for task 4a2b9f10-1823-4c91-b3f2-c90a12b489a1.
 ```
+
+---
+
+## Resume & Engineering Highlights
+
+- **Distributed Control Plane & Data Plane Separation:** Engineered a decentralized container orchestration architecture inspired by Google Borg and Kubernetes, decoupling centralized cluster state from autonomous node worker daemons.
+- **Resource-Aware Cost Scheduling (EPVM):** Implemented an Enhanced Parallel Virtual Machine cost-function scheduler that balances node CPU, memory load, and task density to prevent hotspotting and over-subscription.
+- **State Machine & Lifecycle Reconciliation:** Designed an explicit state machine (`Pending` → `Scheduled` → `Running` → `Completed`/`Failed`) backed by an automated reconciliation loop that detects partitioned or crashed nodes and reschedules orphaned workloads under strict restart policies (`always`, `on-failure`, `never`).
+- **Crash Consistency & Persistence:** Integrated transactional, zero-dependency embedded BoltDB (`bbolt`) storage engines for both control plane and workers to guarantee immediate state recovery across daemon restarts.
+- **Production Observability & Resilience:** Standardized structured JSON logging using Go standard library `log/slog`, request tracing middleware, health endpoints, graceful shutdown via OS signal trapping, and comprehensive unit tests with Go race detection.
 
 ---
 

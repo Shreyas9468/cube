@@ -3,6 +3,7 @@ package manager
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"time"
@@ -86,4 +87,54 @@ func (a *Api) GetNodesHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(200)
 	json.NewEncoder(w).Encode(a.Manager.GetNodes())
+}
+
+// GetTaskHandler returns the latest state of a specific task.
+func (a *Api) GetTaskHandler(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskID")
+	tID, err := uuid.Parse(taskID)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrResponse{HttpStatusCode: 400, Message: "invalid task ID"})
+		return
+	}
+	taskList, ok := a.Manager.TaskDb[tID]
+	if !ok || len(taskList) == 0 {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(ErrResponse{HttpStatusCode: 404, Message: "task not found"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(taskList[len(taskList)-1])
+}
+
+// GetLogsHandler proxies container logs from the worker node running the task.
+func (a *Api) GetLogsHandler(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskID")
+	tID, err := uuid.Parse(taskID)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrResponse{HttpStatusCode: 400, Message: "invalid task ID"})
+		return
+	}
+
+	workerHost, ok := a.Manager.TaskWorkerMap[tID]
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(ErrResponse{HttpStatusCode: 404, Message: "task not yet assigned to worker"})
+		return
+	}
+
+	workerAddr := normalizeAddr(workerHost)
+	resp, err := http.Get(fmt.Sprintf("http://%s/tasks/%s/logs", workerAddr, taskID))
+	if err != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(ErrResponse{HttpStatusCode: 502, Message: fmt.Sprintf("failed to contact worker: %v", err)})
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }

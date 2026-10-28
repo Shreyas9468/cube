@@ -16,3 +16,7 @@ data/
 .idea/
 .vscode/
 *.swp
+
+# Local Documentation & Agent Rules
+docs/
+AGENTS.md

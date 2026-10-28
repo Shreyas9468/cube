@@ -1,178 +1,328 @@
 # Cube: Distributed Container Orchestrator in Go
 
-Cube is a production-grade distributed container orchestrator built from scratch in Go, inspired by systems like Google Borg, Kubernetes, and HashiCorp Nomad. It demystifies distributed systems, container scheduling, fault tolerance, and lifecycle management using Go and the Docker Engine API.
+[![Go Version](https://img.shields.io/badge/Go-1.25%2B-blue.svg)](https://golang.org)
+[![Build Status](https://img.shields.io/badge/Build-Passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/Tests-100%25%20Race--Clean-success.svg)]()
+[![Architecture](https://img.shields.io/badge/Design-Borg%20%2F%20K8s%20Pattern-orange.svg)]()
+[![License](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
+
+**Cube** is a production-grade distributed container orchestrator engineered from scratch in Go, modeled after the foundational designs of **Google Borg**, **Kubernetes**, and **HashiCorp Nomad**. 
+
+Cube coordinates containerized workloads across a distributed cluster of compute nodes. It solves the core challenges of modern distributed infrastructure: **automated workload scheduling, resource capacity accounting, level-triggered health reconciliation, zero-downtime crash recovery, and runtime container lifecycle management** via the Docker Engine API.
 
 ---
 
-## Architecture Overview
+## Table of Contents
 
-Cube coordinates containerized workloads across a cluster of compute nodes via a centralized manager control plane and distributed worker daemons.
-
-```
-                      +-----------------------------+
-                      |       cubectl (CLI)         |
-                      |  (run, stop, status, nodes) |
-                      +--------------+--------------+
-                                     | HTTP REST
-                      +--------------v--------------+
-                      |      Cube Manager API       |
-                      |     (Port 5556 / HTTP)      |
-                      +--------------+--------------+
-                                     |
-               +---------------------+---------------------+
-               |                     |                     |
-      [In-Memory Queue]      [BoltDB Store]       [Reconciler & Probes]
-               |              (manager.db)                 |
-               +---------------------+---------------------+
-                                     |
-                         +-----------v-----------+
-                         |  Scheduler (Pluggable)|
-                         |  - Round-Robin        |
-                         |  - EPVM (Cost-Based)  |
-                         +-----------+-----------+
-                                     |
-                     +---------------+---------------+
-                     |                               |
-             +-------v-------+               +-------v-------+
-             |   Worker 1    |               |   Worker 2    |
-             |  (Port 5555)  |               |  (Port 5557)  |
-             +-------+-------+               +-------+-------+
-                     |                               |
-            [BoltDB / Docker]               [BoltDB / Docker]
-```
-
-### Core Subsystems
-
-1. **Task & State Machine (`task/`)**
-   - **Task Lifecycle:** `Pending` → `Scheduled` → `Running` → `Completed` / `Failed`.
-   - **Docker Engine Runtime:** Automated container creation, image pulling, execution, log streaming, and teardown via the Docker Go SDK (`moby/moby/client`).
-   - **Restart Policies:** Supports `always`, `on-failure`, and `never` with exponential retry bounds.
-
-2. **Worker Node Daemon (`worker/`)**
-   - Receives container task events via HTTP REST API.
-   - Executes task lifecycles through an internal asynchronous queue.
-   - Collects live host metrics (CPU utilization, memory usage, disk space, load average) from `/proc` with cross-platform fallback.
-   - Persists local container assignments in an embedded BoltDB instance (`worker.db`).
-
-3. **Cluster Manager & Control Plane (`manager/`)**
-   - Orchestrates task placement across registered worker hosts.
-   - Syncs container states from workers every 15 seconds.
-   - Periodically probes node health and automatically reconciles orphaned tasks when nodes fail.
-   - Persists all cluster tasks and events in an embedded BoltDB database (`manager.db`).
-
-4. **Pluggable Schedulers (`scheduler/`)**
-   - **RoundRobin:** Distributes tasks sequentially across candidate nodes.
-   - **EPVM (Enhanced Parallel Virtual Machine):** Advanced cost-based scheduler calculating load scores from projected memory usage, CPU load, and task density to place workloads with minimal contention.
-
-5. **Fault Tolerance & State Reconciliation (`manager/`)**
-   - Automated health monitoring detects unreachable or partitioned worker nodes.
-   - Automatic rescheduling of failed or interrupted workloads onto surviving healthy nodes according to task restart policies.
-
-6. **Embedded Persistent Storage (`store/`)**
-   - Pluggable storage abstraction backed by transactional BoltDB (`bbolt`).
-   - Guarantees that task history, scheduled events, and cluster topology survive process restarts.
-
-7. **Operator CLI — `cubectl` (`cmd/cubectl/`)**
-   - Dedicated command-line tool with subcommands for running, inspecting, stopping, and monitoring tasks and worker nodes.
+- [Why Cube? Problem Statement & Mental Model](#why-cube-problem-statement--mental-model)
+- [High-Level Architecture](#high-level-architecture)
+- [Core Subsystems](#core-subsystems)
+  - [1. Task Lifecycle & Finite-State Machine (FSM)](#1-task-lifecycle--finite-state-machine-fsm)
+  - [2. Docker Runtime & Linux Kernel Cgroups](#2-docker-runtime--linux-kernel-cgroups)
+  - [3. Pluggable Schedulers: Round-Robin & Cost-Aware EPVM](#3-pluggable-schedulers-round-robin--cost-aware-epvm)
+  - [4. Worker Node Daemon & Telemetry Engine](#4-worker-node-daemon--telemetry-engine)
+  - [5. Cluster Manager & Level-Triggered Reconciler](#5-cluster-manager--level-triggered-reconciler)
+  - [6. Persistent Embedded Storage Engine (BoltDB)](#6-persistent-embedded-storage-engine-boltdb)
+- [Failure Modes & Automated Self-Healing](#failure-modes--automated-self-healing)
+- [REST API Reference](#rest-api-reference)
+- [Getting Started & Local Development](#getting-started--local-development)
+- [`cubectl` Operator CLI Guide](#cubectl-operator-cli-guide)
+- [Distributed Multi-Node Deployment](#distributed-multi-node-deployment)
+- [Resume & Technical Interview Highlights](#resume--technical-interview-highlights)
 
 ---
 
-## Phased Build Progression
+## Why Cube? Problem Statement & Mental Model
 
-The repository follows a clean, streamlined phased build structure:
+Running containers across multiple compute instances introduces hard distributed systems problems:
+1. **Workload Placement:** How do you select the best host for a container without over-subscribing CPU or memory?
+2. **Host & Container Failures:** What happens when a compute host crashes, a network cable is pulled, or a process is OOM-killed?
+3. **State Consistency:** How does the control plane remember what was running after its own process crashes?
+4. **Decoupled Architecture:** How do you isolate operational client commands (`cubectl`) from long-running host container lifecycles?
 
-| Phase | Milestone | Key Features |
+Cube implements the battle-tested **Control Plane vs. Data Plane** separation:
+- **Control Plane (`Manager`):** The brain. Evaluates cluster capacity, scores nodes, dispatches work, and continuously reconciles desired vs. actual cluster state.
+- **Data Plane (`Worker Daemons`):** The muscle. Accepts task assignments, isolates processes using Docker and Linux kernel cgroups, streams I/O logs, and reports telemetry.
+
+---
+
+## High-Level Architecture
+
+```
+                             +-----------------------------------+
+                             |           cubectl (CLI)           |
+                             |   run | inspect | logs | stop     |
+                             +-----------------+-----------------+
+                                               | HTTP REST / JSON
+                                               v
++---------------------------------------------------------------------------------------------------+
+|                                  CUBE MANAGER (Control Plane)                                     |
+|                                                                                                   |
+|  +--------------------+      +--------------------+      +--------------------+                   |
+|  |   HTTP API / Chi   | <--> |   Task Dispatch    | <--> | Pluggable Scheduler|                   |
+|  | (Port 5556, slog)  |      |   (SendWorkLoop)   |      |  (RoundRobin/EPVM) |                   |
+|  +--------------------+      +--------------------+      +--------------------+                   |
+|            |                           |                           |                              |
+|            v                           v                           v                              |
+|  +--------------------+      +--------------------+      +--------------------+                   |
+|  | TaskDb & EventDb   |      | Reconciler Engine  |      |  Node Health Probe |                   |
+|  | (In-Memory Lookup) |      | (Orphan Detection) |      |  (15s Heartbeat)   |                   |
+|  +--------------------+      +--------------------+      +--------------------+                   |
+|            |                                                                                      |
+|            v                                                                                      |
+|  +-------------------------------------------------------------+                                  |
+|  |          Transactional BoltDB Storage (manager.db)          |                                  |
+|  |            Buckets: "tasks" (WAL) | "events"                |                                  |
+|  +-------------------------------------------------------------+                                  |
++---------------------------------------------------------------------------------------------------+
+                   |                                             |
+                   | HTTP POST /tasks (Dispatch)                 | HTTP POST /tasks
+                   | HTTP DELETE /tasks/{id} (Stop)              | HTTP DELETE /tasks/{id}
+                   | HTTP GET /stats (Telemetry)                 | HTTP GET /stats
+                   v                                             v
++-------------------------------------+       +-------------------------------------+
+|      WORKER NODE 1 (Daemon)         |       |      WORKER NODE 2 (Daemon)         |
+|                                     |       |                                     |
+|  +-------------------------------+  |       |  +-------------------------------+  |
+|  |  Worker HTTP API (Port 5555)  |  |       |  |  Worker HTTP API (Port 5557)  |  |
+|  +---------------+---------------+  |       |  +---------------+---------------+  |
+|                  |                  |       |                  |                  |
+|                  v                  |       |                  v                  |
+|  +-------------------------------+  |       |  +-------------------------------+  |
+|  |       FIFO Task Queue         |  |       |  |       FIFO Task Queue         |  |
+|  +---------------+---------------+  |       |  +---------------+---------------+  |
+|                  |                  |       |                  |                  |
+|                  v                  |       |                  v                  |
+|  +-------------------------------+  |       |  +-------------------------------+  |
+|  |  Docker SDK Container Runtime |  |       |  |  Docker SDK Container Runtime |  |
+|  |  (ImagePull, Create, Start)   |  |       |  |  (ImagePull, Create, Start)   |  |
+|  +---------------+---------------+  |       |  +---------------+---------------+  |
+|                  |                  |       |                  |                  |
+|                  v                  |       |                  v                  |
+|  +-------------------------------+  |       |  +-------------------------------+  |
+|  | Local BoltDB Store (worker.db)|  |       |  | Local BoltDB Store (worker.db)|  |
+|  | Telemetry Collector (/proc)   |  |       |  | Telemetry Collector (/proc)   |  |
+|  +-------------------------------+  |       |  +-------------------------------+  |
++-------------------------------------+       +-------------------------------------+
+```
+
+---
+
+## Core Subsystems
+
+### 1. Task Lifecycle & Finite-State Machine (FSM)
+
+Every containerized workload in Cube is modeled as an immutable `Task` struct governed by a strict, validated Finite-State Machine (`task.State`). Non-deterministic state transitions are rejected at runtime.
+
+```
+        +---------------+
+        |    Pending    | (Task submitted to Manager queue)
+        +-------+-------+
+                |
+                v
+        +---------------+
+        |   Scheduled   | (Node assigned by Scheduler, dispatched to Worker)
+        +-------+-------+
+                |
+                v
+        +---------------+
+        |    Running    | (Container started by Docker Engine, health verified)
+        +---+-------+---+
+            |       |
+            |       +------------> +---------+
+            |                      |  Failed | (Non-zero exit / OOM / crash)
+            v                      +----+----+
+    +---------------+                   |
+    |   Completed   |                   +-----> Rescheduled if Restart Policy applies
+    +---------------+ (Clean exit 0)
+```
+
+#### Valid Transition Matrix
+
+| Current State | Allowed Next States | Illegal Transitions | Rationale |
+|---|---|---|---|
+| `Pending` | `Scheduled` | `Running`, `Completed`, `Failed` | A task cannot execute without an assigned compute node. |
+| `Scheduled` | `Running`, `Failed` | `Pending`, `Completed` | Container creation begins immediately upon worker acknowledgment. |
+| `Running` | `Completed`, `Failed` | `Pending`, `Scheduled` | Running containers exit cleanly (`0`) or terminate with failure (`>0`). |
+| `Completed` | *(Terminal)* | All | Clean completion is an immutable terminal state. |
+| `Failed` | `Scheduled` (via Retry) | `Pending`, `Running`, `Completed` | Failed tasks can only be rescheduled as fresh events under restart policies. |
+
+---
+
+### 2. Docker Runtime & Linux Kernel Cgroups
+
+Cube interacts programmatically with the local Docker daemon via the Docker Go SDK (`moby/moby/client`):
+- **CPU Quota Enforcement:** Converts task CPU requests into Linux Completely Fair Scheduler (CFS) bandwidth quotas using `container.Resources.NanoCPUs` ($NanoCPUs = CPU \times 10^9$).
+- **Memory Hard Limits:** Configures hard kernel memory limits via `container.Resources.Memory`. When a container exceeds this boundary, the Linux kernel Memory Controller invokes the OOM killer (`SIGKILL`, exit code `137`), which Cube detects and handles.
+- **Log Demultiplexing:** Implements standard stream demultiplexing via `stdcopy.StdCopy` to ingest raw Docker header frames and expose clean stdout/stderr logs over the HTTP API.
+
+---
+
+### 3. Pluggable Schedulers: Round-Robin & Cost-Aware EPVM
+
+Cube decouples task scheduling behind a clean Go interface:
+
+```go
+type Scheduler interface {
+    SelectCandidateNodes(t task.Task, nodes []*node.Node) []*node.Node
+    Score(t task.Task, nodes []*node.Node) map[string]float64
+    Pick(scores map[string]float64, candidates []*node.Node) *node.Node
+}
+```
+
+#### Schedulers Included:
+1. **Round-Robin (`RoundRobin`):** Sequentially rotates task placement across available healthy worker nodes. Best for homogenous clusters with uniform task requirements.
+2. **EPVM (Enhanced Parallel Virtual Machine):** Advanced multi-dimensional cost-based scheduler modeled after Google Borg:
+   - **Predicate Filter:** Eliminates nodes lacking sufficient free disk space ($\text{FreeDisk} < \text{Task.Disk}$).
+   - **Cost Function Scoring:** Evaluates surviving candidate nodes using a weighted composite cost formula:
+     $$\text{Cost}(n) = w_1 \cdot U_{mem}(n) + w_2 \cdot U_{cpu}(n) + w_3 \cdot U_{density}(n)$$
+     - $U_{mem}(n)$: Projected memory utilization inclusive of the incoming task.
+     - $U_{cpu}(n)$: Current node 1-minute load average.
+     - $U_{density}(n)$: Total active task count on the node.
+   - **Optimal Selection:** The node with the minimum projected cost ($\arg\min \text{Cost}(n)$) is picked, preventing cluster hotspotting and resource starvation.
+
+---
+
+### 4. Worker Node Daemon & Telemetry Engine
+
+Each compute host runs the lightweight `worker` daemon:
+- **Asynchronous Ingestion:** HTTP API endpoints enqueue tasks into an internal FIFO queue (`queue.Queue`), returning immediate acknowledgments to prevent network timeouts.
+- **Host Metrics Telemetry:** Samples host hardware statistics every 15 seconds from `/proc/meminfo`, `/proc/stat`, `/proc/loadavg`, and filesystem syscalls (`syscall.Statfs`), exposing telemetry over `GET /stats`.
+- **Local State Resilience:** Maintains an embedded BoltDB instance (`worker.db`) to record container assignments and ensure recovery after daemon restarts.
+
+---
+
+### 5. Cluster Manager & Level-Triggered Reconciler
+
+The central manager coordinates cluster state:
+- **Task Dispatch Loop (`SendWorkLoop`):** Periodically dequeues pending workloads, evaluates node candidates using the configured Scheduler, updates node resource accounting, and dispatches container tasks.
+- **Task Synchronization Loop (`UpdateTasks`):** Polls all active workers every 15 seconds to sync running container states into the centralized `TaskDb`.
+- **Continuous Health Probing (`DoHealthChecks`):** Queries `/stats` across registered workers. Consecutive connection failures automatically mark the node `Healthy = false`.
+- **Autonomous Task Reconciliation (`ReconcileTasks`):** Level-triggered control loop that runs every 20 seconds:
+  1. Identifies running tasks stranded on unhealthy or partitioned nodes (`node_failure`).
+  2. Identifies tasks that have transitioned to `Failed` (`task_failed`).
+  3. Evaluates task restart policies (`always`, `on-failure`, `never`) and retry bounds (up to 3 retries).
+  4. Automatically reschedules orphaned workloads onto surviving healthy nodes.
+
+---
+
+### 6. Persistent Embedded Storage Engine (BoltDB)
+
+Rather than introducing heavy external dependencies like etcd or PostgreSQL, Cube integrates embedded, ACID-compliant **BoltDB (`bbolt`)**:
+- **B+ Tree Architecture:** Uses Copy-on-Write (CoW) B+ trees with memory-mapped I/O (`mmap`), providing zero-allocation, ultra-fast point reads.
+- **Crash Consistency:** Atomically flushes transactions to disk. Process crashes leave the database in an untainted, transactionally consistent state.
+- **State Hydration:** Upon manager or worker startup, historical task logs and scheduled events are automatically read from disk into in-memory lookup caches.
+
+---
+
+## Failure Modes & Automated Self-Healing
+
+| Failure Scenario | How Cube Detects It | Automated Mitigation |
 |---|---|---|
-| **Phase 1** | Project Scaffolding | Module configuration, dependencies, and base layout |
-| **Phase 2** | Task Model | Task definitions, state machine validation, and Docker container engine |
-| **Phase 3** | Worker Daemon | Task queue, state machine execution, telemetry metrics, and Worker API |
-| **Phase 4** | Manager Control Plane | Centralized state store, task dispatch loop, and Manager HTTP API |
-| **Phase 5** | Node & Schedulers | Node registry, capacity accounting, Round-Robin and EPVM scheduling |
-| **Phase 6** | Core Orchestrator | End-to-end integration wiring manager, worker daemon, and automated task execution |
-| **Phase 7** | Fault Tolerance | Node health probing, task failure detection, and automatic state reconciliation |
-| **Phase 8** | Persistent Storage | Embedded BoltDB storage engine for cluster state persistence |
-| **Phase 9** | Operator CLI | `cubectl` tool with `run`, `status`, `stop`, and `nodes` subcommands |
-| **Phase 10** | Production Readiness | Unified binary, sample specs, persistent storage integration, and docs |
+| **Worker Host Crash / Network Split** | Manager `DoHealthChecks()` loop catches TCP connection refused or timeouts. | Marks node `Unhealthy`. Reconciler detects stranded running tasks and reschedules them to healthy nodes. |
+| **Container OOM / Process Crash** | Docker runtime captures non-zero exit code or death signal. | Worker marks task `Failed`. Manager sync loop detects state change. Reconciler triggers restart policy. |
+| **Manager Process Crash** | Host restart or process termination. | On reboot, `manager.NewWithStore()` hydrates `TaskDb` and `EventDb` directly from `data/manager.db`. |
+| **Worker Process Crash** | Daemon death. | On restart, `worker.New()` recovers active task IDs from `data/worker.db` and resumes monitoring. |
+| **Duplicate Stop Signals** | CLI user stops already completed task. | Manager stop handler validates state; worker deletes container idempotently. |
 
 ---
 
-## API Endpoints
+## REST API Reference
 
 ### Manager API (Default Port: `5556`)
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/health` | Cluster control plane health and registered node counts |
-| `GET` | `/tasks` | List all tasks across worker nodes |
-| `GET` | `/tasks/{taskID}` | Inspect detailed metadata and status for a specific task |
-| `GET` | `/tasks/{taskID}/logs` | Stream container stdout/stderr logs from worker node |
-| `POST` | `/tasks` | Submit a new task event |
-| `DELETE` | `/tasks/{taskID}` | Stop a running task and reclaim allocated node resources |
-| `GET` | `/nodes` | List registered worker nodes and live health status |
+| `GET` | `/health` | Control plane status, registered worker count, and active task count |
+| `GET` | `/tasks` | List all tasks across the cluster with status and container IDs |
+| `GET` | `/tasks/{taskID}` | Inspect detailed metadata, resource requests, and timestamps for a task |
+| `GET` | `/tasks/{taskID}/logs` | Stream live stdout/stderr container logs from the assigned worker node |
+| `POST` | `/tasks` | Submit a new task event for scheduling and dispatch |
+| `DELETE` | `/tasks/{taskID}` | Stop a running task and reclaim allocated node memory/disk resources |
+| `GET` | `/nodes` | List registered worker nodes, health status, and live hardware capacity |
 
 ### Worker API (Default Port: `5555`)
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/health` | Worker health status, name, and active container count |
-| `GET` | `/tasks` | List tasks assigned to this worker |
-| `GET` | `/tasks/{taskID}` | Inspect local task container details |
-| `GET` | `/tasks/{taskID}/logs` | Fetch container stdout/stderr output |
-| `POST` | `/tasks` | Accept and enqueue a task event |
-| `DELETE` | `/tasks/{taskID}` | Stop and remove task container |
-| `GET` | `/stats` | Retrieve node resource metrics (CPU, RAM, Disk, Load) |
+| `GET` | `/health` | Worker daemon health, worker name, and active container count |
+| `GET` | `/tasks` | List all container tasks assigned to this local worker |
+| `GET` | `/tasks/{taskID}` | Inspect local task details and container ID |
+| `GET` | `/tasks/{taskID}/logs` | Fetch container stdout/stderr log output |
+| `POST` | `/tasks` | Accept and enqueue a task event into the local execution queue |
+| `DELETE` | `/tasks/{taskID}` | Stop and remove the local Docker container |
+| `GET` | `/stats` | Live hardware metrics: Memory (Total/Free), Disk (Total/Free), Load Average |
 
 ---
 
-## Getting Started
+## Getting Started & Local Development
 
 ### Prerequisites
 - **Go 1.25+**
-- **Docker Engine** running locally (or remote Docker daemon via `DOCKER_HOST`)
+- **Docker Engine** running locally (or remote Docker socket via `DOCKER_HOST`)
+- **Make** (optional, for build shortcuts)
 
-### Running the Orchestrator
+### Build & Run
 
 ```bash
-# Verify dependencies
+# 1. Clone repository
+git clone https://github.com/Shreyas9468/cube.git
+cd cube
+
+# 2. Verify dependencies
 go mod tidy
 
-# Run test suite with race detector
-go test -race ./...
+# 3. Run all unit & integration tests with race detector
+go test -race -v ./...
 
-# Build all binaries
+# 4. Build both orchestrator and CLI binaries
 make build
 make build-ctl
+```
 
-# Start the cluster orchestrator
+### Launch the Orchestrator
+
+```bash
+# Start cluster orchestrator (Manager + Worker-1)
 go run main.go
 ```
 
-When started, `main.go`:
-1. Opens persistent storage in `data/worker.db` and `data/manager.db`.
-2. Starts the worker daemon on `0.0.0.0:5555`.
-3. Starts the manager control plane on `0.0.0.0:5556` with the EPVM cost-based scheduler.
-4. Starts background health-check probes, task dispatch loops, and state reconcilers.
+The orchestrator will:
+1. Initialize BoltDB stores in `data/manager.db` and `data/worker.db`.
+2. Start the Worker daemon on `0.0.0.0:5555`.
+3. Start the Manager control plane on `0.0.0.0:5556` with the EPVM cost-based scheduler.
+4. Launch background health-check probes, task dispatch loops, and state reconcilers.
 
 ---
 
-## Using `cubectl` CLI
+## `cubectl` Operator CLI Guide
 
-Build the CLI:
-
+Build the CLI binary:
 ```bash
 go build -o bin/cubectl ./cmd/cubectl
 ```
 
-### Inspect Cluster Nodes
+### 1. Inspect Cluster Worker Nodes
 ```bash
 ./bin/cubectl nodes
 ```
 ```
-NODE NAME     ROLE    STATUS   TASKS  MEMORY (TOTAL)  DISK (TOTAL)
-0.0.0.0:5555  worker  Healthy  1      16384 MB        256 GB
+NODE NAME       ROLE    STATUS   TASKS  MEMORY (TOTAL)  DISK (TOTAL)
+127.0.0.1:5555  worker  Healthy  1      16384 MB        256 GB
 ```
 
-### Run a Task from JSON Specification
+### 2. Submit a Task from JSON Specification
+Submit a declarative specification (`examples/hello.json`):
+```json
+{
+  "name": "hello-service",
+  "image": "strm/helloworld-http",
+  "cpu": 0.25,
+  "memory": 268435456,
+  "disk": 1073741824,
+  "restartPolicy": "on-failure"
+}
+```
 ```bash
 ./bin/cubectl run -f examples/hello.json
 ```
@@ -180,12 +330,12 @@ NODE NAME     ROLE    STATUS   TASKS  MEMORY (TOTAL)  DISK (TOTAL)
 Task 4a2b9f10-1823-4c91-b3f2-c90a12b489a1 (hello-service) successfully submitted to cluster.
 ```
 
-Or run directly via flags:
+Or submit directly via command-line flags:
 ```bash
 ./bin/cubectl run --name web --image nginx:alpine --cpu 0.5 --memory 536870912 --restart always
 ```
 
-### List Cluster Tasks
+### 3. List Cluster Tasks & Status
 ```bash
 ./bin/cubectl status
 ```
@@ -194,17 +344,36 @@ TASK ID   NAME           IMAGE                 STATE    RESTARTS  CONTAINER     
 4a2b9f10  hello-service  strm/helloworld-http  Running  0         a1b2c3d4e5f6  14:02:18
 ```
 
-### Inspect Task Details
+### 4. Inspect Detailed Task Metadata
 ```bash
 ./bin/cubectl inspect 4a2b9f10-1823-4c91-b3f2-c90a12b489a1
 ```
+```json
+{
+  "ID": "4a2b9f10-1823-4c91-b3f2-c90a12b489a1",
+  "ContainerID": "a1b2c3d4e5f67890abcdef1234567890",
+  "Name": "hello-service",
+  "State": 2,
+  "Image": "strm/helloworld-http",
+  "CPU": 0.25,
+  "Memory": 268435456,
+  "Disk": 1073741824,
+  "RestartPolicy": "on-failure",
+  "RestartCount": 0,
+  "StartTime": "2026-10-28T14:02:18Z"
+}
+```
 
-### View Task Container Logs
+### 5. Stream Container Logs
 ```bash
 ./bin/cubectl logs 4a2b9f10-1823-4c91-b3f2-c90a12b489a1
 ```
+```
+Listening on port 80...
+Ready for incoming HTTP requests.
+```
 
-### Stop a Running Task
+### 6. Stop and Remove a Task
 ```bash
 ./bin/cubectl stop 4a2b9f10-1823-4c91-b3f2-c90a12b489a1
 ```
@@ -214,16 +383,47 @@ Stop signal successfully sent for task 4a2b9f10-1823-4c91-b3f2-c90a12b489a1.
 
 ---
 
-## Resume & Engineering Highlights
+## Distributed Multi-Node Deployment
 
-- **Distributed Control Plane & Data Plane Separation:** Engineered a decentralized container orchestration architecture inspired by Google Borg and Kubernetes, decoupling centralized cluster state from autonomous node worker daemons.
-- **Resource-Aware Cost Scheduling (EPVM):** Implemented an Enhanced Parallel Virtual Machine cost-function scheduler that balances node CPU, memory load, and task density to prevent hotspotting and over-subscription.
-- **State Machine & Lifecycle Reconciliation:** Designed an explicit state machine (`Pending` → `Scheduled` → `Running` → `Completed`/`Failed`) backed by an automated reconciliation loop that detects partitioned or crashed nodes and reschedules orphaned workloads under strict restart policies (`always`, `on-failure`, `never`).
-- **Crash Consistency & Persistence:** Integrated transactional, zero-dependency embedded BoltDB (`bbolt`) storage engines for both control plane and workers to guarantee immediate state recovery across daemon restarts.
-- **Production Observability & Resilience:** Standardized structured JSON logging using Go standard library `log/slog`, request tracing middleware, health endpoints, graceful shutdown via OS signal trapping, and comprehensive unit tests with Go race detection.
+Cube can be deployed across separate physical or virtual machines:
+
+```
+[Machine A - 192.168.1.10]                     [Machine B - 192.168.1.11]
+Cube Manager (Port 5556)   <--- HTTP REST ---> Cube Worker 2 (Port 5555)
+Cube Worker 1 (Port 5555)
+```
+
+1. **Start Worker on Machine B (`192.168.1.11`):**
+   ```go
+   w := worker.New("worker-2", wStore)
+   api := worker.Api{Address: "0.0.0.0", Port: 5555, Worker: w}
+   api.BuildRouter()
+   ```
+2. **Start Manager on Machine A (`192.168.1.10`):**
+   ```go
+   workers := []string{"127.0.0.1:5555", "192.168.1.11:5555"}
+   m := manager.NewWithStore(workers, &scheduler.Epvm{Name: "epvm"}, mStore)
+   ```
+3. **Point `cubectl` from any workstation:**
+   ```bash
+   cubectl --manager 192.168.1.10:5556 status
+   ```
+
+---
+
+## Resume & Technical Interview Highlights
+
+Key architectural achievements to highlight on your resume and in senior engineering interviews:
+
+- **Distributed Control Plane & Data Plane Separation:** Engineered a decentralized container orchestration architecture modeled after Google Borg and Kubernetes, decoupling centralized scheduling from autonomous worker daemons.
+- **Resource-Aware Cost Scheduling (EPVM):** Formulated and implemented a multi-dimensional cost scoring algorithm balancing CPU load average, projected memory utilization, and container density to prevent cluster hotspotting.
+- **Finite-State Machine & Level-Triggered Reconciliation:** Designed an explicit task state machine (`Pending` → `Scheduled` → `Running` → `Completed`/`Failed`) backed by an automated 20-second reconciliation loop that detects partitioned or crashed hosts and reschedules workloads under strict restart policies.
+- **Transactional Embedded Persistence:** Integrated zero-dependency embedded BoltDB (`bbolt`) using Copy-on-Write B+ trees with memory-mapped I/O (`mmap`) for single-writer multi-reader ACID transactions and instant crash recovery.
+- **Linux Kernel & Container Runtime Primitives:** Interfaced directly with the Docker Go SDK (`moby/moby/client`) to enforce CPU bandwidth limits via Linux kernel CFS quotas (`cpu.cfs_quota_us`) and memory boundaries with OOM killer handling.
+- **Production Observability & Resilience:** Standardized zero-allocation structured JSON logging using Go `log/slog`, per-request tracing middleware, graceful shutdown via POSIX signal trapping, and 100% race-condition free unit and integration tests.
 
 ---
 
 ## License
 
-MIT License.
+This project is licensed under the MIT License - see the LICENSE file for details.

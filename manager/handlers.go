@@ -34,6 +34,16 @@ func (a *Api) StartTaskHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if te.Task.ID == uuid.Nil {
+		te.Task.ID = uuid.New()
+	}
+	if te.ID == uuid.Nil {
+		te.ID = uuid.New()
+	}
+	te.Task.State = task.Scheduled
+	te.State = task.Scheduled
+	te.Timestamp = time.Now().UTC()
+
 	a.Manager.AddTask(te)
 	log.Printf("Added task %v\n", te.Task.ID)
 	w.WriteHeader(201)

@@ -93,9 +93,16 @@ func (e *Epvm) Score(t task.Task, nodes []*node.Node) map[string]float64 {
 			continue
 		}
 		cpuLoad := calculateLoad(cpuUsage, math.Pow(2, 0.8))
-		memAlloc := float64(n.Stats.MemStats.MemTotal-n.Stats.MemStats.MemAvailable) / float64(n.Stats.MemStats.MemTotal)
-		memReq := float64(t.Memory) / float64(n.Stats.MemStats.MemTotal)
-		memLoad := calculateLoad(memAlloc+memReq, math.Pow(2, 0.8))
+		var memLoad float64
+		if n.Stats.MemStats != nil && n.Stats.MemStats.MemTotal > 0 {
+			memAlloc := float64(n.Stats.MemStats.MemTotal-n.Stats.MemStats.MemAvailable) / float64(n.Stats.MemStats.MemTotal)
+			memReq := float64(t.Memory) / float64(n.Stats.MemStats.MemTotal)
+			memLoad = calculateLoad(memAlloc+memReq, math.Pow(2, 0.8))
+		} else if n.Memory > 0 {
+			memAlloc := float64(n.MemoryAllocated) / float64(n.Memory)
+			memReq := float64(t.Memory) / float64(n.Memory)
+			memLoad = calculateLoad(memAlloc+memReq, math.Pow(2, 0.8))
+		}
 		taskLoad := calculateLoad(float64(n.TaskCount)/maxJobs, math.Pow(2, 0.8))
 
 		nodeScores[n.Name] = cpuLoad + memLoad + taskLoad

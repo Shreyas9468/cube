@@ -120,8 +120,16 @@ func (n *Node) GetStats() error {
 	}
 
 	n.Stats = stats
-	n.Memory = int64(stats.MemStats.MemTotal)
-	n.Disk = int64(stats.DiskStats.All)
+	if stats.MemStats != nil {
+		n.Memory = int64(stats.MemStats.MemTotal)
+	} else {
+		n.Memory = 1024 * 1024 * 1024
+	}
+	if stats.DiskStats != nil {
+		n.Disk = int64(stats.DiskStats.All)
+	} else {
+		n.Disk = 10 * 1024 * 1024 * 1024
+	}
 	n.TaskCount = stats.TaskCount
 	n.Healthy = true
 	n.LastSeen = time.Now().UTC()

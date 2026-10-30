@@ -411,6 +411,153 @@ Cube Worker 1 (Port 5555)
 
 ---
 
+## Live Demo Walkthrough
+
+End-to-end demo with real output. Requires Docker Desktop running.
+
+### Step 1 — Start the Cluster
+
+```bash
+go run main.go
+```
+
+**Output:**
+```json
+{"time":"2026-10-31T00:52:17Z","level":"INFO","msg":"Cube orchestrator starting","version":"dev","commit":"unknown","built":"unknown"}
+{"time":"2026-10-31T00:52:17Z","level":"INFO","msg":"Initialising worker daemon","address":"0.0.0.0:5555"}
+{"time":"2026-10-31T00:52:17Z","level":"INFO","msg":"Recovered tasks from store","worker":"worker-1","count":0}
+{"time":"2026-10-31T00:52:17Z","level":"INFO","msg":"Initialising manager with EPVM scheduler","address":"0.0.0.0:5556"}
+{"time":"2026-10-31T00:52:18Z","level":"INFO","msg":"Worker API listening","addr":"0.0.0.0:5555"}
+{"time":"2026-10-31T00:52:18Z","level":"INFO","msg":"Manager API listening","addr":"0.0.0.0:5556"}
+{"time":"2026-10-31T00:52:18Z","level":"INFO","msg":"Sample task submitted","task_id":"38d4fae4-a1e3-45f7-9eee-e57abdf355bb","image":"strm/helloworld-http"}
+```
+
+### Step 2 — Inspect Cluster Nodes
+
+```bash
+curl -s http://localhost:5556/nodes | jq
+```
+
+**Output:**
+```json
+[
+  {
+    "Name": "127.0.0.1:5555",
+    "Ip": "127.0.0.1:5555",
+    "Memory": 1073741824,
+    "Disk": 10737418240,
+    "Role": "worker",
+    "TaskCount": 0,
+    "Healthy": true,
+    "LastSeen": "2026-10-30T19:22:32Z"
+  }
+]
+```
+
+### Step 3 — Submit a Task (nginx:alpine)
+
+> Memory must be ≥ 6 MB (Docker enforced minimum). Use `67108864` = 64 MB.
+
+```bash
+curl -s -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"Task":{"Name":"demo-nginx","Image":"nginx:alpine","Disk":1000,"Memory":67108864}}' \
+  http://localhost:5556/tasks
+```
+
+**Output:**
+```json
+{
+  "ID": "8ab209cd-647d-4e01-a108-0054e9a0e24b",
+  "Name": "demo-nginx",
+  "State": 1,
+  "Image": "nginx:alpine",
+  "Memory": 67108864,
+  "Disk": 1000
+}
+```
+
+Manager log (background):
+```json
+{"level":"INFO","msg":"Dispatching task from pending queue","task_id":"8ab209cd-...","image":"nginx:alpine"}
+{"level":"INFO","msg":"Task assigned to worker","task_id":"8ab209cd-...","worker":"127.0.0.1:5555"}
+{"level":"INFO","msg":"Worker acknowledged task","task_id":"8ab209cd-...","worker":"127.0.0.1:5555"}
+{"level":"INFO","msg":"Container started","container_id":"ddbeccf5c1a6...","image":"nginx:alpine"}
+{"level":"INFO","msg":"Container started","task_id":"8ab209cd-...","container_id":"ddbeccf5c1a6..."}
+```
+
+### Step 4 — Verify Container is Running
+
+```bash
+docker ps
+```
+
+**Output:**
+```
+CONTAINER ID   IMAGE          COMMAND                  CREATED        STATUS        PORTS                   NAMES
+ddbeccf5c1a6   nginx:alpine   "/docker-entrypoint.…"   5 seconds ago  Up 5 seconds  0.0.0.0:32768->80/tcp   demo-nginx
+```
+
+### Step 5 — Check Task State via Worker & Manager APIs
+
+```bash
+# Worker view (runtime truth)
+curl -s http://localhost:5555/tasks | jq
+
+# Manager view (control plane)
+curl -s http://localhost:5556/tasks | jq
+```
+
+**Worker output (State 2 = Running):**
+```json
+[{
+  "ID": "8ab209cd-647d-4e01-a108-0054e9a0e24b",
+  "ContainerID": "ddbeccf5c1a6012e54aad2a59229218da7fdfe574cbed66a04c3a944087693e5",
+  "Name": "demo-nginx",
+  "State": 2,
+  "Image": "nginx:alpine",
+  "StartTime": "2026-10-30T19:27:14Z"
+}]
+```
+
+### Step 6 — Stop the Task
+
+```bash
+curl -s -X DELETE http://localhost:5556/tasks/8ab209cd-647d-4e01-a108-0054e9a0e24b
+```
+
+Manager log:
+```json
+{"level":"INFO","msg":"Task stop completed","task_id":"8ab209cd-...","worker":"127.0.0.1:5555"}
+{"level":"INFO","msg":"Stopping container","container_id":"ddbeccf5c1a6..."}
+{"level":"INFO","msg":"Container removed","container_id":"ddbeccf5c1a6..."}
+{"level":"INFO","msg":"Container stopped","task_id":"8ab209cd-...","container_id":"ddbeccf5c1a6..."}
+```
+
+**Verify gone:**
+```bash
+docker ps
+```
+```
+CONTAINER ID   IMAGE     COMMAND   CREATED   STATUS    PORTS     NAMES
+```
+
+Container destroyed. Task lifecycle complete.
+
+---
+
+### State Reference
+
+| State Value | Name      | Meaning                              |
+|-------------|-----------|--------------------------------------|
+| `0`         | Pending   | Submitted, awaiting dispatch         |
+| `1`         | Scheduled | Assigned to worker, not yet running  |
+| `2`         | Running   | Container actively running           |
+| `3`         | Completed | Gracefully stopped                   |
+| `4`         | Failed    | Container exited with error          |
+
+---
+
 ## Resume & Technical Interview Highlights
 
 Key architectural achievements to highlight on your resume and in senior engineering interviews:
